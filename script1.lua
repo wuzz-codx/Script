@@ -1,5 +1,5 @@
 --[[
-    MAX HUB  |  Anime Dice  |  V1.3
+    MAX HUB  |  Anime Dice  |  V1.4
 
     Record & Replay engine: tap RECORD, then tap the game's own button once.
     The hub captures exactly what the game sends and replays it, so it keeps
@@ -35,7 +35,7 @@ local TweenService = game:GetService("TweenService")
 local LP        = Players.LocalPlayer
 local PlayerGui = LP:WaitForChild("PlayerGui")
 
-local VERSION     = "1.3"
+local VERSION     = "1.4"
 local CONFIG_FILE = "MaxHub_AnimeDice.json"
 local SCAN_FILE   = "MaxHub_Scan.txt"
 local CATS        = { "Grade", "Trait", "Quirk" }
@@ -76,7 +76,7 @@ local FARM_SLOTS = {
 ------------------------------------------------------------------------
 local Cfg = {
     Delay = 0.35, MaxUnread = 8, MaxNoChange = 10,
-    AntiAFK = true, Protect = true, PauseFarm = true, Spy = false,
+    AntiAFK = true, Protect = true, PauseFarm = true, Spy = false, Turbo = true,
     BoostEvery = 0, -- minutes, 0 = only when a luck session starts
     HopPct = 50,    -- server finder: need this % more luck than now
     HopMax = 30,    -- server finder: give up after N servers
@@ -374,6 +374,7 @@ local RemoteTimes = setmetatable({}, { __mode = "k" })
 local Learn = nil
 local HookOK = false
 local onLearnUpdate -- set by UI
+local autoLearn     -- set after the roll engine exists
 
 local function onOutgoing(remote, method, args)
     if not Alive then return end
@@ -385,6 +386,8 @@ local function onOutgoing(remote, method, args)
     if Learn then
         table.insert(Learn.calls, { remote = remote, method = method, args = args, t = os.clock() })
         if onLearnUpdate then onLearnUpdate() end
+    elseif autoLearn then
+        pcall(autoLearn, remote, method, args)
     end
 end
 
@@ -418,7 +421,6 @@ end
 ------------------------------------------------------------------------
 local Recipes = {}      -- key -> live recipe
 local BoostRecipes = {} -- list of live recipes
-local Pools = {}        -- cat -> list of { value, inst, label }
 
 local function recipeToCfg(rec)
     local calls = {}
@@ -431,7 +433,7 @@ local function recipeToCfg(rec)
     local out = { calls = calls, label = rec.label }
     if rec.unit then
         local sv = ser(rec.unit.value)
-        out.unit = { ci = rec.unit.ci, i = rec.unit.i, k = rec.unit.k, value = sv }
+        out.unit = { ci = rec.unit.ci, i = rec.unit.i, k = rec.unit.k, kind = rec.unit.kind, value = sv }
     end
     return out
 end
@@ -444,7 +446,7 @@ local function recipeFromCfg(s)
         if not remote then return nil end
         table.insert(rec.calls, { remote = remote, method = c.method, args = deserArgs(c.args) })
     end
-    if s.unit then rec.unit = { ci = s.unit.ci, i = s.unit.i, k = s.unit.k, value = deser(s.unit.value) } end
+    if s.unit then rec.unit = { ci = s.unit.ci, i = s.unit.i, k = s.unit.k, kind = s.unit.kind or "legacy", value = deser(s.unit.value) } end
     return rec
 end
 
@@ -574,15 +576,119 @@ local function unitLabel(inst, idx)
     return #tags > 0 and (name .. " [" .. table.concat(tags, "|") .. "]") or name
 end
 
-local ID_ATTRS = { "Id", "ID", "UID", "Uid", "UUID", "GUID", "Guid" }
+local ID_ATTRS = { "Id", "ID", "UID", "Uid", "UUID", "GUID", "Guid", "UnitId", "UnitID", "Key" }
+local STAT_FOLDERS = { stats = true, data = true, info = true, traits = true, attributes = true, values = true, properties = true, config = true }
 
-local function findUnitPool(value)
+-- Units (shared by Grade / Trait / Quirk). Each entry: { inst, label, value? }
+local Units, UnitsFrom = {}, "not scanned"
+
+-- Ways a remote might identify a unit
+local function unitIds(e)
+    local inst = e.inst
+    local out = { { "inst", inst }, { "name", inst.Name } }
+    for _, a in ipairs(ID_ATTRS) do
+        local v = inst:GetAttribute(a)
+        if v ~= nil then table.insert(out, { "attr:" .. a, v }) end
+        local c = inst:FindFirstChild(a)
+        if c and c:IsA("ValueBase") then table.insert(out, { "val:" .. a, c.Value }) end
+    end
+    if e.value ~= nil then table.insert(out, { "legacy", e.value }) end
+    return out
+end
+
+local function idOf(e, kind)
+    if not e then return nil end
+    if kind == "inst" then return e.inst end
+    if kind == "name" then return e.inst.Name end
+    if kind == "legacy" then return e.value end
+    local how, a = tostring(kind):match("^(%a+):(.+)$")
+    if how == "attr" then return e.inst:GetAttribute(a) end
+    if how == "val" then
+        local c = e.inst:FindFirstChild(a)
+        return c and c.Value
+    end
+end
+
+local function isMarker(key, val)
+    if type(val) ~= "string" then return false end
+    for _, cat in ipairs(CATS) do
+        if #Data[cat] > 0 and exactName(val, Data[cat]) then
+            if tostring(key):lower():find(cat:lower(), 1, true) or cat == "Trait" then return true end
+        end
+    end
+    return false
+end
+
+local function unitOfMarker(m)
+    local u = m:IsA("ValueBase") and m.Parent or m
+    while u and u.Parent and STAT_FOLDERS[u.Name:lower()] do u = u.Parent end
+    return u
+end
+
+local function ownerScore(cont)
+    local me, uid = LP.Name:lower(), tostring(LP.UserId)
+    local cur = cont
+    while cur and cur ~= game do
+        local n = cur.Name:lower()
+        if n == me or n:find(uid, 1, true) then return 1000 end
+        local o = cur:GetAttribute("Owner") or cur:GetAttribute("Player") or cur:GetAttribute("UserId")
+        if o ~= nil then
+            if tostring(o):lower() == me or tostring(o) == uid then return 1000 end
+            return -1 -- someone else's
+        end
+        local p = Players:FindFirstChild(cur.Name)
+        if p and p ~= LP then return -1 end
+        cur = cur.Parent
+    end
+    return 0
+end
+
+-- Find the player's unit inventory by looking for trait/grade values
+local function scanUnits()
+    local counts, units = {}, {}
+    local function consider(u)
+        if not u or not u.Parent or units[u] then return end
+        units[u] = true
+        counts[u.Parent] = (counts[u.Parent] or 0) + 1
+    end
+    local function scan(root)
+        for _, d in ipairs(root:GetDescendants()) do
+            for k, v in pairs(d:GetAttributes()) do
+                if isMarker(k, v) then consider(d) break end
+            end
+            if d:IsA("StringValue") and isMarker(d.Name, d.Value) then consider(unitOfMarker(d)) end
+        end
+    end
+    for _, ch in ipairs(LP:GetChildren()) do
+        if not ch:IsA("PlayerGui") and not ch:IsA("PlayerScripts") then scan(ch) end
+    end
+    scan(RS)
+    if not next(counts) then scan(workspace) end
+
+    local best, bestScore = nil, -math.huge
+    for cont, n in pairs(counts) do
+        local own = ownerScore(cont)
+        if own >= 0 and n + own > bestScore then best, bestScore = cont, n + own end
+    end
+    if not best then return nil end
+
+    local cls
+    for u in pairs(units) do if u.Parent == best then cls = u.ClassName break end end
+    local out = {}
+    for _, c in ipairs(best:GetChildren()) do
+        if c.ClassName == cls then table.insert(out, { inst = c }) end
+    end
+    return out, best
+end
+
+-- Fallback: build the unit list from the unit argument of a recorded roll
+local function poolFromValue(value)
     if typeof(value) == "Instance" then
         local p = value.Parent
         if not p then return nil end
         local out = {}
         for _, c in ipairs(p:GetChildren()) do
-            if c.ClassName == value.ClassName then table.insert(out, { value = c, inst = c }) end
+            if c.ClassName == value.ClassName then table.insert(out, { inst = c, value = c }) end
         end
         return out
     end
@@ -591,26 +697,16 @@ local function findUnitPool(value)
         for _, d in ipairs(root:GetDescendants()) do
             if d.Name == value and d.Parent then
                 local out = {}
-                for _, c in ipairs(d.Parent:GetChildren()) do table.insert(out, { value = c.Name, inst = c }) end
+                for _, c in ipairs(d.Parent:GetChildren()) do table.insert(out, { inst = c, value = c.Name }) end
                 return out
             end
             if d:IsA("StringValue") and d.Value == value and d.Parent and d.Parent.Parent then
                 local key, out = d.Name, {}
                 for _, c in ipairs(d.Parent.Parent:GetChildren()) do
                     local v = c:FindFirstChild(key)
-                    if v and v:IsA("StringValue") then table.insert(out, { value = v.Value, inst = c }) end
+                    if v and v:IsA("StringValue") then table.insert(out, { inst = c, value = v.Value }) end
                 end
                 return out
-            end
-            for _, a in ipairs(ID_ATTRS) do
-                if d:GetAttribute(a) == value and d.Parent then
-                    local out = {}
-                    for _, c in ipairs(d.Parent:GetChildren()) do
-                        local cv = c:GetAttribute(a)
-                        if cv ~= nil then table.insert(out, { value = cv, inst = c }) end
-                    end
-                    return out
-                end
             end
         end
     end
@@ -626,46 +722,98 @@ local function looksLikeUnit(v)
     return false
 end
 
-local function detectUnit(rec)
+local function eachArg(rec, fn)
     for ci, call in ipairs(rec.calls) do
         for i = 1, call.args.n do
             local a = call.args[i]
-            if looksLikeUnit(a) then
-                local pool = findUnitPool(a)
-                if pool and #pool > 0 then return { ci = ci, i = i, value = a }, pool end
-            elseif type(a) == "table" then
+            if fn(ci, i, nil, a) then return true end
+            if type(a) == "table" then
                 for k, x in pairs(a) do
-                    if (type(k) == "string" or type(k) == "number") and looksLikeUnit(x) then
-                        local pool = findUnitPool(x)
-                        if pool and #pool > 0 then return { ci = ci, i = i, k = k, value = x }, pool end
-                    end
+                    if (type(k) == "string" or type(k) == "number") and fn(ci, i, k, x) then return true end
                 end
             end
         end
     end
 end
 
-local function sameValue(a, b) return a == b end
-
-local function currentUnit(cat)
-    local rec = Recipes[cat]
-    if not rec or not rec.unit then return nil, nil end
-    local pool = Pools[cat]
-    local want = deser(Cfg[cat].Unit)
-    if want == nil then want = rec.unit.value end
-    if pool then
-        for i, e in ipairs(pool) do
-            if sameValue(e.value, want) then return e.value, e.inst, e, i end
+-- Which argument of the roll is the unit, and in which form?
+local KIND_RANK = { inst = 1, legacy = 2, name = 4 }
+local function matchUnitArg(rec)
+    local found, foundRank
+    eachArg(rec, function(ci, i, k, a)
+        if a == nil or type(a) == "boolean" or type(a) == "table" then return false end
+        for _, e in ipairs(Units) do
+            for _, id in ipairs(unitIds(e)) do
+                if id[2] == a then
+                    local r = KIND_RANK[id[1]] or 3
+                    if not foundRank or r < foundRank then
+                        found, foundRank = { ci = ci, i = i, k = k, kind = id[1], value = a }, r
+                    end
+                end
+            end
         end
-    end
-    return want, nil
+        return foundRank == 1
+    end)
+    return found
 end
 
-local function refreshPool(cat)
+local function labelUnits()
+    for i, e in ipairs(Units) do e.label = unitLabel(e.inst, i) end
+end
+
+local function refreshUnits()
+    local list, from = scanUnits()
+    if list and #list > 0 then
+        Units, UnitsFrom = list, from:GetFullName()
+    else
+        -- fall back to whatever a recorded roll points at
+        Units, UnitsFrom = {}, "none found"
+        for _, cat in ipairs(CATS) do
+            local rec = Recipes[cat]
+            if rec then
+                local hit
+                eachArg(rec, function(_, _, _, a)
+                    if looksLikeUnit(a) then
+                        local pool = poolFromValue(a)
+                        if pool and #pool > 0 then hit = pool return true end
+                    end
+                end)
+                if hit then Units, UnitsFrom = hit, "recorded " .. cat .. " roll" break end
+            end
+        end
+    end
+    labelUnits()
+    for _, cat in ipairs(CATS) do
+        local rec = Recipes[cat]
+        if rec then rec.unit = matchUnitArg(rec) or rec.unit end
+    end
+    return #Units
+end
+
+local function entryByPath(path)
+    if type(path) ~= "table" then return nil end
+    for i, e in ipairs(Units) do
+        local p = instPath(e.inst)
+        if p and #p == #path then
+            local same = true
+            for j = 1, #p do if p[j] ~= path[j] then same = false break end end
+            if same then return e, i end
+        end
+    end
+end
+
+-- Selected unit for a category: saved choice > unit in the recorded roll > first
+local function currentEntry(cat)
+    if #Units == 0 then return nil end
+    local e, i = entryByPath(Cfg[cat].UnitPath)
+    if e then return e, i end
     local rec = Recipes[cat]
-    local pool = (rec and rec.unit and findUnitPool(rec.unit.value)) or {}
-    for i, e in ipairs(pool) do e.label = unitLabel(e.inst, i) end
-    Pools[cat] = pool
+    if rec and rec.unit then
+        for j, x in ipairs(Units) do
+            if idOf(x, rec.unit.kind) == rec.unit.value then return x, j end
+        end
+    end
+    return Units[1], 1
 end
 
 -- Load saved recipes
@@ -677,7 +825,6 @@ for _, s in ipairs(Cfg.Boosts) do
     local rec = recipeFromCfg(s)
     if rec then table.insert(BoostRecipes, rec) end
 end
-for _, cat in ipairs(CATS) do refreshPool(cat) end
 
 ------------------------------------------------------------------------
 -- UI-based fallbacks (when nothing is recorded)
@@ -1101,10 +1248,7 @@ local function finishLearn()
     local parts = {}
     for _, c in ipairs(calls) do table.insert(parts, describeCall(c.remote, c.method, c.args)) end
     rec.label = table.concat(parts, " > ")
-    if L.wantUnit then
-        local u = detectUnit(rec)
-        rec.unit = u
-    end
+    if L.wantUnit then rec.unit = matchUnitArg(rec) end
     log("Recorded " .. L.title .. ": " .. rec.label)
     L.onDone(rec)
 end
@@ -1164,7 +1308,13 @@ local function refreshCatUI(cat)
     end
     if r.Rec then
         local rec = Recipes[cat]
-        r.Rec.Text = rec and ("Recorded: " .. rec.label) or "Not recorded - tap RECORD ROLL (uses on-screen button meanwhile)"
+        if not rec then
+            r.Rec.Text = "Roll not learned yet: open the game's " .. cat .. "s menu and tap Roll once (the hub learns it by itself)."
+        elseif rec.unit then
+            r.Rec.Text = (rec.auto and "Learned automatically" or "Recorded") .. " - unit picker active. " .. rec.label
+        else
+            r.Rec.Text = (rec.auto and "Learned automatically" or "Recorded") .. " - game uses the unit selected in its menu. " .. rec.label
+        end
     end
     if r.Unit then r.Unit() end
 end
@@ -1229,7 +1379,8 @@ local function waitResult(cat, ctx)
         local n, r = singleName(ctx.ret, list)
         if n then return n, r, true end
     end
-    local timeout = math.max(1.2, Cfg.Delay + 1)
+    local timeout = Cfg.Turbo and 0.8 or math.max(1.2, Cfg.Delay + 1)
+    local poll = Cfg.Turbo and 0.015 or 0.05
     while os.clock() - ctx.t0 < timeout do
         if Running ~= cat then return nil end
         for _, e in ipairs(ctx.inbox) do
@@ -1252,7 +1403,7 @@ local function waitResult(cat, ctx)
                 end
             end
         end
-        task.wait(0.08)
+        task.wait(poll)
     end
     if ctx.unitInst then
         local n, r = readUnitData(cat, ctx.unitInst)
@@ -1276,14 +1427,18 @@ local function runSession(cat)
     if not rec then
         rollBtn = findRollButton(panel)
         if not rollBtn then
-            setStatus("Tap RECORD ROLL first (or open the " .. cat .. " roll screen)")
-            notify("Record the " .. cat .. " roll first")
+            setStatus("Open the game's " .. cat .. "s menu and tap Roll once, then START")
+            notify("Tap the game's " .. cat .. " Roll once first")
             return
         end
     end
     local label_ = resolve(Cfg.Bind[cat].Result)
-    refreshPool(cat)
-    local unitValue, unitInst = currentUnit(cat)
+    if #Units == 0 then refreshUnits() end
+    local unitValue, unitInst, unitIdx = nil, nil, nil
+    if rec and rec.unit then
+        local e, i = currentEntry(cat)
+        if e then unitValue, unitInst, unitIdx = idOf(e, rec.unit.kind), e.inst, i end
+    end
 
     if #Data[cat] == 0 and not label_ then
         setStatus("No " .. cat .. " names known: use Custom target + Bind Result")
@@ -1292,7 +1447,7 @@ local function runSession(cat)
 
     Running = cat
     refreshCatUI(cat)
-    log(("%s roll started -> %s%s"):format(cat, tgt, unitInst and (" on " .. unitLabel(unitInst, select(4, currentUnit(cat)))) or ""))
+    log(("%s roll started -> %s%s"):format(cat, tgt, unitInst and (" on " .. unitLabel(unitInst, unitIdx)) or ""))
 
     if Cfg.Protect then
         local n, r
@@ -1338,13 +1493,14 @@ local function runSession(cat)
         table.clear(inbox)
         local ctx = {
             t0 = os.clock(), inbox = inbox, scope = panel, label = label_, unitInst = unitInst,
-            before = snapshot(panel, label_), unitBefore = unitInst and readUnitData(cat, unitInst) or nil,
+            before = snapshot((not unitInst) and panel or nil, label_), unitBefore = unitInst and readUnitData(cat, unitInst) or nil,
         }
         if rec then
             local ok, ret = playRecipe(rec, unitValue)
             if not ok then stopRoll(tostring(ret)) break end
             ctx.ret = ret
         else
+            if not rollBtn.Parent or not shown(rollBtn) then stopRoll("menu closed") break end
             press(rollBtn)
         end
         local name, rank, changed = waitResult(cat, ctx)
@@ -1370,8 +1526,8 @@ local function runSession(cat)
             setStatus(("%s #%d -> unreadable (%d/%d)"):format(cat, Stats[cat].rolls, unread, Cfg.MaxUnread))
             if unread >= Cfg.MaxUnread then stopRoll("can't read result: tap Bind Result") break end
         end
-        refreshCatUI(cat)
-        task.wait(Cfg.Delay)
+        if not Cfg.Turbo or Stats[cat].rolls % 10 == 0 then refreshCatUI(cat) end
+        task.wait(Cfg.Turbo and 0 or Cfg.Delay)
     end
     errConn:Disconnect()
     for _, cn in ipairs(inConns) do cn:Disconnect() end
@@ -1382,6 +1538,74 @@ local function toggleRoll(cat)
     if Running == cat then stopRoll("stopped by you") return end
     if Running then stopRoll("switched to " .. cat) task.wait(0.2) end
     task.spawn(runSession, cat)
+end
+
+------------------------------------------------------------------------
+-- Auto-learn: when you tap Roll in the game's Trait/Grade/Quirk menu the
+-- hub picks that action up by itself (no Record button needed).
+------------------------------------------------------------------------
+local AUTO_EXCLUDE = { "skip", "confirm", "toggle", "setting", "lock", "buy", "purchase", "robux", "jackpot", "auto", "favorite", "sell", "delete" }
+local AUTO_ROLL = { "roll", "spin", "reroll" }
+
+autoLearn = function(remote, method, args)
+    local text = remote:GetFullName():lower()
+    for i = 1, math.min(args.n, 6) do
+        local a = args[i]
+        if type(a) == "string" then
+            text ..= " " .. a:lower()
+        elseif type(a) == "table" then
+            for k, v in pairs(a) do
+                if type(k) == "string" then text ..= " " .. k:lower() end
+                if type(v) == "string" then text ..= " " .. v:lower() end
+            end
+        end
+    end
+    for _, w in ipairs(AUTO_EXCLUDE) do
+        if text:find(w, 1, true) then return end
+    end
+    local rolly = false
+    for _, w in ipairs(AUTO_ROLL) do
+        if text:find(w, 1, true) then rolly = true break end
+    end
+
+    local target
+    for _, cat in ipairs(CATS) do
+        if text:find(cat:lower(), 1, true) then target = cat break end
+    end
+    if not target and rolly then
+        -- Generic remote: decide by which menu is open
+        local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1, 1)
+        for _, cat in ipairs(CATS) do
+            local p = findPanel(cat)
+            if p and p.AbsoluteSize.X * p.AbsoluteSize.Y > 0.12 * vp.X * vp.Y then target = cat break end
+        end
+    end
+    if not target then return end
+    local existing = Recipes[target]
+    if existing and not existing.auto then return end -- a manual recording wins
+
+    local rec = { calls = { { remote = remote, method = method, args = args } }, auto = true }
+    rec.label = describeCall(remote, method, args)
+    if #Units == 0 then refreshUnits() end
+    rec.unit = matchUnitArg(rec)
+    if not rolly and not rec.unit then return end
+
+    local sameAsBefore = existing and existing.label == rec.label
+    Recipes[target] = rec
+    if rec.unit then
+        local e = nil
+        for _, x in ipairs(Units) do
+            if idOf(x, rec.unit.kind) == rec.unit.value then e = x break end
+        end
+        if e then Cfg[target].UnitPath = instPath(e.inst) end
+    end
+    Cfg.Recipes[target] = recipeToCfg(rec)
+    saveCfg()
+    if not sameAsBefore then
+        log(("Learned %s roll from your tap: %s"):format(target, rec.label))
+        notify(target .. " roll learned - press START")
+    end
+    refreshCatUI(target)
 end
 
 ------------------------------------------------------------------------
@@ -1529,7 +1753,7 @@ local LuckLabel
 do
     local c = card(PMain)
     label(c, "Quick start", 15, Theme.Accent, true)
-    label(c, "1. Luck tab > Trait > RECORD ROLL.\n2. Open the game's Traits menu, pick your unit, tap its Roll once, then tap the red banner.\n3. Choose Unit + Stop at, press START.\nSame idea for Grade, Quirk, boosts and every Farm macro.", 12, Theme.Sub)
+    label(c, "1. Open the game's Traits (or Grade / Quirk) menu and tap Roll once - the hub learns it by itself.\n2. Luck tab: pick your Unit and the Stop at target.\n3. Press START. Turbo rolls as fast as the game answers.", 12, Theme.Sub)
     local s = card(PMain)
     LuckLabel = label(s, "Luck: -", 13, Theme.Text, true)
     label(s, HookOK and "Recorder: ready" or "Recorder: NOT supported here (UI fallback only)", 11, HookOK and Theme.On or Theme.Bad)
@@ -1553,7 +1777,14 @@ end
 -- LUCK
 local Selectors = {}
 do
+    local sp = card(PLuck)
+    sp.LayoutOrder = 0
+    label(sp, "Speed", 15, Theme.Accent, true)
+    toggle(sp, "Turbo roll", "Rolls again the instant a result is read", function() return Cfg.Turbo end, function(v) Cfg.Turbo = v end)
+    label(sp, "If the game ignores rolls when spammed, turn Turbo off and raise the delay in Settings.", 10, Theme.Sub)
+
     local b = card(PLuck)
+    b.LayoutOrder = 10
     label(b, "Luck Boosts", 15, Theme.Accent, true)
     local boostInfo = label(b, "", 11, Theme.Sub)
     local function renderBoost()
@@ -1587,6 +1818,7 @@ end
 
 do
     local h = card(PLuck)
+    h.LayoutOrder = 11
     label(h, "Server Finder", 15, Theme.Accent, true)
     label(h, "Every server has the same base odds. This hops servers until your shown luck is higher (luck event / weather active), then stops so you can roll there.", 11, Theme.Sub)
     stepper(h, "Need more luck than now (%)", function() return Cfg.HopPct end, function(v) Cfg.HopPct = v end, 10, 10, 1000, "+%d%%")
@@ -1598,28 +1830,21 @@ end
 
 local function buildLuck(cat)
     local c = card(PLuck)
+    c.LayoutOrder = table.find(CATS, cat) == 2 and 1 or table.find(CATS, cat) == 1 and 2 or 3
     label(c, cat .. " Luck", 15, Theme.Accent, true)
 
-    -- Unit selector
+    -- Unit selector (filled automatically from your inventory)
     UIRefs[cat].Unit = cycler(c, "Unit", function()
-        local rec = Recipes[cat]
-        if not rec then return "(record a roll first)" end
-        if not rec.unit then return "(as recorded - re-record to change)" end
-        local _, inst, entry, idx = currentUnit(cat)
-        if inst then
-            entry.label = unitLabel(inst, idx)
-            return ("%d/%d  %s"):format(idx, #Pools[cat], entry.label)
-        end
-        return "As recorded (ID " .. short(rec.unit.value) .. ") - tap Units"
+        if #Units == 0 then return "No units found yet - tap Units" end
+        local e, idx = currentEntry(cat)
+        e.label = unitLabel(e.inst, idx)
+        return ("%d/%d  %s"):format(idx, #Units, e.label)
     end, function(d)
-        local pool = Pools[cat] or {}
-        if #pool == 0 then refreshPool(cat) pool = Pools[cat] end
-        if #pool == 0 then return end
-        local cur = currentUnit(cat)
-        local idx = 1
-        for i, e in ipairs(pool) do if sameValue(e.value, cur) then idx = i break end end
-        idx = ((idx - 1 + d) % #pool) + 1
-        Cfg[cat].Unit = ser(pool[idx].value)
+        if #Units == 0 then refreshUnits() end
+        if #Units == 0 then return end
+        local _, idx = currentEntry(cat)
+        idx = (((idx or 1) - 1 + d) % #Units) + 1
+        Cfg[cat].UnitPath = instPath(Units[idx].inst)
         saveCfg()
     end)
 
@@ -1653,23 +1878,22 @@ local function buildLuck(cat)
     box.FocusLost:Connect(function() Cfg[cat].Custom = box.Text saveCfg() end)
 
     local r = hrow(c, 30)
-    smallBtn(r, "RECORD ROLL", 0.4, Theme.Rec).Activated:Connect(function()
+    smallBtn(r, "Re-learn Roll", 0.4, Theme.Rec).Activated:Connect(function()
         startLearn(cat .. " roll", "Open " .. cat .. "s, select your unit, tap Roll ONCE", LEARN_HINT[cat], true, function(rec)
             Recipes[cat] = rec
+            Cfg[cat].UnitPath = nil
+            refreshUnits()
             Cfg.Recipes[cat] = recipeToCfg(rec)
-            Cfg[cat].Unit = nil
             if not Cfg.Recipes[cat] then log(cat .. " recording works this session only (can't be saved)") end
             saveCfg()
-            refreshPool(cat)
-            if rec.unit then log(("%s: found %d unit(s) to choose from"):format(cat, #(Pools[cat] or {}))) end
             refreshCatUI(cat)
         end)
     end)
     smallBtn(r, "Bind Result", 0.3).Activated:Connect(function() startBind(cat) end)
     smallBtn(r, "Units", 0.3).Activated:Connect(function()
-        refreshPool(cat)
-        refreshCatUI(cat)
-        setStatus(("%s: %d unit(s) found"):format(cat, #(Pools[cat] or {})))
+        local n = refreshUnits()
+        for _, k in ipairs(CATS) do refreshCatUI(k) end
+        setStatus(("%d unit(s) found (%s)"):format(n, UnitsFrom))
     end)
 
     UIRefs[cat].Rec = label(c, "", 10, Theme.Sub)
@@ -1795,7 +2019,8 @@ do
         Cfg.Recipes, Cfg.Boosts = {}, {}
         table.clear(Recipes) table.clear(BoostRecipes)
         saveCfg()
-        for _, cat in ipairs(CATS) do refreshPool(cat) refreshCatUI(cat) end
+        refreshUnits()
+        for _, cat in ipairs(CATS) do refreshCatUI(cat) end
         setStatus("Cleared")
     end)
     button(m, "Unload MAX HUB", Theme.Bad).Activated:Connect(function() genv.MaxHubCleanup() end)
@@ -1880,6 +2105,9 @@ task.spawn(function()
     local n = learnGameData()
     for _, r in pairs(Selectors) do r() end
     if genv.MaxHubRenderSrc then genv.MaxHubRenderSrc() end
+    local units = refreshUnits()
+    for _, cat in ipairs(CATS) do refreshCatUI(cat) end
+    log(units > 0 and ("Found %d unit(s) in %s"):format(units, UnitsFrom) or "No units found yet: open your backpack/Traits menu, then tap Units")
     log(n > 0 and ("Game data synced (" .. n .. " table(s))") or "Using built-in trait/grade lists")
     if not HookOK then log("Recorder unavailable: executor lacks hookmetamethod") end
     local exec = identifyexecutor and identifyexecutor() or "executor"
