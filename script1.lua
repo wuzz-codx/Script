@@ -1,12 +1,12 @@
 --[[
-    MAX HUB  |  Anime Dice  |  V1.4
+    MAX HUB  |  Anime Dice  |  V1.5
 
     Record & Replay engine: tap RECORD, then tap the game's own button once.
     The hub captures exactly what the game sends and replays it, so it keeps
     working after game updates without hard-coded remote names.
 
-      Luck tab : Trait / Grade / Quirk auto roll with unit (hero) selector,
-                 Stop-at target, one-click luck boosts.
+      Luck tab : Trait / Grade / Quirk auto roll with unit picker (real unit
+                 names), Stop-at target, Turbo, one-click luck boosts.
       Farm tab : Auto Roll units, Rebirth, Upgrade, Claim, Quest, 2 custom macros.
 
     Luck multipliers are calculated by the game server. This hub cannot raise
@@ -35,7 +35,7 @@ local TweenService = game:GetService("TweenService")
 local LP        = Players.LocalPlayer
 local PlayerGui = LP:WaitForChild("PlayerGui")
 
-local VERSION     = "1.4"
+local VERSION     = "1.5"
 local CONFIG_FILE = "MaxHub_AnimeDice.json"
 local SCAN_FILE   = "MaxHub_Scan.txt"
 local CATS        = { "Grade", "Trait", "Quirk" }
@@ -78,8 +78,6 @@ local Cfg = {
     Delay = 0.35, MaxUnread = 8, MaxNoChange = 10,
     AntiAFK = true, Protect = true, PauseFarm = true, Spy = false, Turbo = true,
     BoostEvery = 0, -- minutes, 0 = only when a luck session starts
-    HopPct = 50,    -- server finder: need this % more luck than now
-    HopMax = 30,    -- server finder: give up after N servers
     Grade = { Target = "Z+",      OrBetter = true, MaxLuck = true, Custom = "", Unit = nil },
     Trait = { Target = "Eternal", OrBetter = true, MaxLuck = true, Custom = "", Unit = nil },
     Quirk = { Target = "",        OrBetter = true, MaxLuck = true, Custom = "", Unit = nil },
@@ -108,6 +106,9 @@ local function loadCfg()
     end
 end
 loadCfg()
+if isfile and writefile and pcall(isfile, "MaxHub_Hop.json") and isfile("MaxHub_Hop.json") then
+    pcall(writefile, "MaxHub_Hop.json", '{"active":false}') -- stop the old v1.3 server hop loop
+end
 for _, s in ipairs(FARM_SLOTS) do
     Cfg.Farm[s.key] = Cfg.Farm[s.key] or {}
     Cfg.Farm[s.key].On = false -- never auto-start farming on load
@@ -492,7 +493,6 @@ local function playRecipe(rec, unitValue)
 end
 
 -- Units ------------------------------------------------------------------
-local UNIT_LABEL_KEYS = { "DisplayName", "UnitName", "Unit", "Character", "Hero", "Name" }
 
 local function readUnitData(cat, inst)
     if not inst or not inst.Parent then return nil end
@@ -520,60 +520,134 @@ local function readUnitData(cat, inst)
     if loose and cat == "Trait" then return loose[1], loose[2] end
 end
 
--- Units are often stored under numeric IDs; dig out a real character name.
-local GENERIC_NAMES = { folder = true, model = true, data = true, stats = true, value = true, unit = true, units = true,
-    inventory = true, ["true"] = true, ["false"] = true, none = true, default = true }
+-- Anime Dice unit names (Update 5/6). Extra names are learned from the game.
+local KNOWN_UNITS = {
+    "Enol", "Sakuna", "Madera", "Maheto", "Todoh", "Super Saiyen", "Goko", "Zaro", "Hasoka", "Deko",
+    "Bakuga", "Todoraki", "Tanjuro", "Perfect Zell", "Kakeshi", "Friza", "Nezuka", "Tien", "Inasuke",
+    "Krillan", "Aizan", "Ginyou", "Ichiga", "Naroto", "Gujo", "Levy", "Pikolo", "Zenitsa",
+}
+-- Copy tags: mutation / size. "Classic" is the plain copy, never a unit name.
+local COPY_TAGS = { classic = "Classic", normal = "Normal", silver = "Silver", gold = "Gold", golden = "Gold",
+    emerald = "Emerald", diamond = "Diamond", ruby = "Ruby", rainbow = "Rainbow", shiny = "Shiny",
+    huge = "Huge", titanic = "Titanic", big = "Big" }
+local BAD_NAME_KEYS = { "mutation", "variant", "size", "dice", "rarity", "tier", "type", "grade", "trait", "quirk", "owner", "id" }
+
+local KnownSet = {}
+local function addKnown(n)
+    if type(n) == "string" and #n >= 2 and #n <= 30 then KnownSet[n:lower()] = n end
+end
+for _, n in ipairs(KNOWN_UNITS) do addKnown(n) end
+
+-- Learn every unit name the game ships (folders/modules named Units, Characters...)
+local function learnUnitNames()
+    local before = 0
+    for _ in pairs(KnownSet) do before += 1 end
+    for _, d in ipairs(RS:GetDescendants()) do
+        local n = d.Name:lower()
+        if (d:IsA("Folder") or d:IsA("Model") or d:IsA("Configuration")) and (n == "units" or n == "characters" or n == "heroes" or n == "unitmodels" or n == "viewmodels") then
+            for _, ch in ipairs(d:GetChildren()) do
+                if not COPY_TAGS[ch.Name:lower()] then addKnown(ch.Name) end
+            end
+        end
+    end
+    local after = 0
+    for _ in pairs(KnownSet) do after += 1 end
+    return after - before
+end
+
+local function knownName(v)
+    if type(v) ~= "string" then return nil end
+    local t = clean(v):lower()
+    if KnownSet[t] then return KnownSet[t] end
+    -- "Goko_Gold", "Shiny Goko", "Goko2" ...
+    for low, real in pairs(KnownSet) do
+        if #low >= 4 and t:find(low, 1, true) then return real end
+    end
+end
 
 local function isNameLike(s)
     if type(s) ~= "string" then return false end
     s = clean(s)
-    if #s < 2 or #s > 30 then return false end
-    if not s:match("^%a[%a%s%.'%-_]*%d?$") then return false end
-    if GENERIC_NAMES[s:lower()] then return false end
+    if #s < 3 or #s > 30 then return false end
+    if not s:match("^%a[%a%s%.'%-_]*$") then return false end
+    if COPY_TAGS[s:lower()] then return false end
+    local low = s:lower()
+    if low == "true" or low == "false" or low == "none" or low == "folder" or low == "model" or low == "unit" then return false end
     for _, cat in ipairs(CATS) do
         if exactName(s, Data[cat]) then return false end
     end
     return true
 end
 
-local function keyScore(k)
+local function badKey(k)
     k = tostring(k):lower()
-    for i, w in ipairs(UNIT_LABEL_KEYS) do
-        if k:find(w:lower(), 1, true) then return 20 - i end
+    for _, w in ipairs(BAD_NAME_KEYS) do
+        if k:find(w, 1, true) then return true end
     end
-    if k:find("type", 1, true) or k:find("species", 1, true) or k:find("base", 1, true) then return 5 end
-    return 0
+    return false
+end
+
+-- Every (key, string) pair stored on a unit: attributes, StringValues, child names
+local function unitStrings(inst)
+    local out = { { "__name", inst.Name } }
+    for k, v in pairs(inst:GetAttributes()) do
+        if type(v) == "string" then table.insert(out, { k, v }) end
+    end
+    for _, d in ipairs(inst:GetDescendants()) do
+        if d:IsA("StringValue") then table.insert(out, { d.Name, d.Value }) end
+        for k, v in pairs(d:GetAttributes()) do
+            if type(v) == "string" then table.insert(out, { k, v }) end
+        end
+        if d.Parent == inst and (d:IsA("Model") or d:IsA("Folder") or d:IsA("Configuration")) then
+            table.insert(out, { "__child", d.Name })
+        end
+    end
+    return out
 end
 
 local function unitName(inst)
-    local best, bestScore = nil, -1
-    local function consider(k, v)
-        if isNameLike(v) then
-            local s = keyScore(k)
-            if s > bestScore then best, bestScore = clean(v), s end
+    local strs = unitStrings(inst)
+    for _, kv in ipairs(strs) do -- 1) a real Anime Dice unit name anywhere
+        local n = knownName(kv[2])
+        if n then return n end
+    end
+    local best, bestScore = nil, -1 -- 2) best-looking name under a sensible key
+    for _, kv in ipairs(strs) do
+        local k, v = kv[1], kv[2]
+        if isNameLike(v) and not badKey(k) then
+            local kl = tostring(k):lower()
+            local score = (kl:find("name", 1, true) or kl:find("unit", 1, true) or kl:find("char", 1, true) or kl:find("hero", 1, true)) and 10
+                or (k == "__child" and 3) or (k == "__name" and 2) or 1
+            if score > bestScore then best, bestScore = clean(v), score end
         end
     end
-    for k, v in pairs(inst:GetAttributes()) do consider(k, v) end
-    for _, d in ipairs(inst:GetDescendants()) do
-        if d:IsA("StringValue") then consider(d.Name, d.Value) end
-        for k, v in pairs(d:GetAttributes()) do consider(k, v) end
+    return best
+end
+
+local function copyTags(inst)
+    local tags, seen = {}, {}
+    for _, kv in ipairs(unitStrings(inst)) do
+        local v = type(kv[2]) == "string" and clean(kv[2]):lower() or ""
+        local tag = COPY_TAGS[v]
+        if tag and tag ~= "Classic" and tag ~= "Normal" and not seen[tag] then
+            seen[tag] = true
+            table.insert(tags, tag)
+        end
     end
-    if best then return best end
-    if isNameLike(inst.Name) then return inst.Name end
-    for _, ch in ipairs(inst:GetChildren()) do
-        if (ch:IsA("Model") or ch:IsA("Folder") or ch:IsA("Configuration")) and isNameLike(ch.Name) then return ch.Name end
-    end
+    return tags
 end
 
 local function unitLabel(inst, idx)
-    local name = unitName(inst) or ("Unit #" .. tostring(idx or inst.Name))
-    if #name > 20 then name = name:sub(1, 18) .. ".." end
-    local tags = {}
+    local name = unitName(inst) or ("Unit " .. tostring(idx or "?"))
+    if #name > 18 then name = name:sub(1, 16) .. ".." end
+    local tags = copyTags(inst)
+    if #tags > 0 then name = name .. " (" .. table.concat(tags, ", ") .. ")" end
+    local stats = {}
     for _, cat in ipairs(CATS) do
         local n = readUnitData(cat, inst)
-        if n then table.insert(tags, n) end
+        if n then table.insert(stats, n) end
     end
-    return #tags > 0 and (name .. " [" .. table.concat(tags, "|") .. "]") or name
+    return #stats > 0 and (name .. " [" .. table.concat(stats, "|") .. "]") or name
 end
 
 local ID_ATTRS = { "Id", "ID", "UID", "Uid", "UUID", "GUID", "Guid", "UnitId", "UnitID", "Key" }
@@ -651,16 +725,19 @@ local function scanUnits()
         units[u] = true
         counts[u.Parent] = (counts[u.Parent] or 0) + 1
     end
-    local function scan(root)
+    -- byName: inside the player's own data a unit-name value also marks a unit
+    local function scan(root, byName)
         for _, d in ipairs(root:GetDescendants()) do
             for k, v in pairs(d:GetAttributes()) do
-                if isMarker(k, v) then consider(d) break end
+                if isMarker(k, v) or (byName and knownName(v) and not badKey(k)) then consider(d) break end
             end
-            if d:IsA("StringValue") and isMarker(d.Name, d.Value) then consider(unitOfMarker(d)) end
+            if d:IsA("StringValue") and (isMarker(d.Name, d.Value) or (byName and knownName(d.Value) and not badKey(d.Name))) then
+                consider(unitOfMarker(d))
+            end
         end
     end
     for _, ch in ipairs(LP:GetChildren()) do
-        if not ch:IsA("PlayerGui") and not ch:IsA("PlayerScripts") then scan(ch) end
+        if not ch:IsA("PlayerGui") and not ch:IsA("PlayerScripts") then scan(ch, true) end
     end
     scan(RS)
     if not next(counts) then scan(workspace) end
@@ -911,24 +988,6 @@ local function findLuckText()
         end
     end
     return best
-end
-
-local LUCK_SUFFIX = {
-    k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, qd = 1e15, qi = 1e18, qn = 1e18,
-    sx = 1e21, sp = 1e24, oc = 1e27, no = 1e30, dc = 1e33,
-}
-local function parseLuck(t)
-    if not t then return nil end
-    local s = (t:lower():gsub(",", ""))
-    local num, suf = s:match("x([%d%.]+)(%a*)")
-    num = tonumber(num)
-    if not num then return nil end
-    if suf ~= "" then
-        local mult = LUCK_SUFFIX[suf]
-        if not mult then return nil end
-        num *= mult
-    end
-    return num
 end
 
 ------------------------------------------------------------------------
@@ -1665,86 +1724,6 @@ track(UIS.InputBegan:Connect(function(input)
 end))
 
 ------------------------------------------------------------------------
--- Server finder: hop until the shown luck is higher (luck events/weather)
-------------------------------------------------------------------------
-local TeleportService = game:GetService("TeleportService")
-local HOP_FILE = "MaxHub_Hop.json"
-local LOADER = 'loadstring(game:HttpGet("https://raw.githubusercontent.com/wuzz-codx/Script/main/script1.lua"))()'
-
-local function readHop()
-    if not (isfile and readfile) then return nil end
-    local ok, t = pcall(function()
-        if isfile(HOP_FILE) then return HttpService:JSONDecode(readfile(HOP_FILE)) end
-    end)
-    return ok and type(t) == "table" and t or nil
-end
-
-local function writeHop(t)
-    if writefile then pcall(writefile, HOP_FILE, HttpService:JSONEncode(t)) end
-end
-
-local function stopHop(reason)
-    local st = readHop()
-    if st and st.active then
-        st.active = false
-        writeHop(st)
-    end
-    if reason then log("Server finder: " .. reason) setStatus("Server finder: " .. reason) end
-end
-
-local function hopNow(st)
-    st.tries = (st.tries or 0) + 1
-    st.visited = st.visited or {}
-    st.visited[game.JobId] = true
-    writeHop(st)
-
-    local servers = {}
-    local ok, body = pcall(function()
-        return game:HttpGet(("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true"):format(game.PlaceId))
-    end)
-    if ok then
-        local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
-        if ok2 and type(data) == "table" and type(data.data) == "table" then
-            for _, s in ipairs(data.data) do
-                if s.id ~= game.JobId and not st.visited[s.id] and (s.playing or 0) < (s.maxPlayers or 1) then
-                    table.insert(servers, s.id)
-                end
-            end
-        end
-    end
-
-    local qot = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
-    if qot then pcall(qot, LOADER) end
-
-    log(("Server finder: hop %d/%d (%d servers listed)"):format(st.tries, st.max, #servers))
-    if #servers > 0 then
-        TeleportService:TeleportToPlaceInstance(game.PlaceId, servers[math.random(1, #servers)], LP)
-    else
-        TeleportService:Teleport(game.PlaceId, LP)
-    end
-end
-
-local function startHop()
-    local base = parseLuck(findLuckText())
-    if not base then
-        setStatus("Server finder: can't read your luck (the x... number on screen)")
-        return
-    end
-    local st = { active = true, base = base, target = base * (1 + Cfg.HopPct / 100), tries = 0, max = Cfg.HopMax, visited = {} }
-    log(("Server finder: luck now %s, looking for %.3g+"):format(findLuckText(), st.target))
-    hopNow(st)
-end
-
-track(TeleportService.TeleportInitFailed:Connect(function(player)
-    if player ~= LP then return end
-    local st = readHop()
-    if st and st.active then
-        log("Server finder: teleport failed, retrying")
-        task.delay(3, function() if Alive then hopNow(st) end end)
-    end
-end))
-
-------------------------------------------------------------------------
 -- Pages
 ------------------------------------------------------------------------
 local LuckLabel
@@ -1760,7 +1739,6 @@ do
     local stopAll = button(s, "STOP EVERYTHING", Theme.Bad)
     stopAll.Activated:Connect(function()
         stopRoll("stop all")
-        stopHop()
         for _, slot in ipairs(FARM_SLOTS) do Cfg.Farm[slot.key].On = false end
         for _, f in ipairs(genv.MaxHubFarmRenders or {}) do f() end
         setStatus("Everything stopped")
@@ -1816,18 +1794,6 @@ do
     stepper(b, "Re-use boosts every (min)", function() return Cfg.BoostEvery end, function(v) Cfg.BoostEvery = v end, 1, 0, 60, "%d")
 end
 
-do
-    local h = card(PLuck)
-    h.LayoutOrder = 11
-    label(h, "Server Finder", 15, Theme.Accent, true)
-    label(h, "Every server has the same base odds. This hops servers until your shown luck is higher (luck event / weather active), then stops so you can roll there.", 11, Theme.Sub)
-    stepper(h, "Need more luck than now (%)", function() return Cfg.HopPct end, function(v) Cfg.HopPct = v end, 10, 10, 1000, "+%d%%")
-    stepper(h, "Max servers to try", function() return Cfg.HopMax end, function(v) Cfg.HopMax = v end, 5, 5, 200, "%d")
-    local r = hrow(h, 32)
-    smallBtn(r, "FIND LUCKY SERVER", 0.6, Theme.On).Activated:Connect(startHop)
-    smallBtn(r, "Stop", 0.4, Theme.Bad).Activated:Connect(function() stopHop("stopped by you") end)
-end
-
 local function buildLuck(cat)
     local c = card(PLuck)
     c.LayoutOrder = table.find(CATS, cat) == 2 and 1 or table.find(CATS, cat) == 1 and 2 or 3
@@ -1838,7 +1804,7 @@ local function buildLuck(cat)
         if #Units == 0 then return "No units found yet - tap Units" end
         local e, idx = currentEntry(cat)
         e.label = unitLabel(e.inst, idx)
-        return ("%d/%d  %s"):format(idx, #Units, e.label)
+        return ("%s   (%d of %d)"):format(e.label, idx, #Units)
     end, function(d)
         if #Units == 0 then refreshUnits() end
         if #Units == 0 then return end
@@ -2105,6 +2071,8 @@ task.spawn(function()
     local n = learnGameData()
     for _, r in pairs(Selectors) do r() end
     if genv.MaxHubRenderSrc then genv.MaxHubRenderSrc() end
+    local extra = learnUnitNames()
+    if extra > 0 then log(("Learned %d extra unit name(s) from the game"):format(extra)) end
     local units = refreshUnits()
     for _, cat in ipairs(CATS) do refreshCatUI(cat) end
     log(units > 0 and ("Found %d unit(s) in %s"):format(units, UnitsFrom) or "No units found yet: open your backpack/Traits menu, then tap Units")
@@ -2113,26 +2081,4 @@ task.spawn(function()
     local exec = identifyexecutor and identifyexecutor() or "executor"
     setStatus("Ready | " .. tostring(exec) .. " | build " .. game.PlaceVersion)
 
-    -- Continue a server-finder run after teleporting
-    local st = readHop()
-    if st and st.active then
-        setStatus("Server finder: checking this server...")
-        local luck
-        for _ = 1, 15 do -- give the HUD up to ~15s to load
-            luck = parseLuck(findLuckText())
-            if luck then break end
-            task.wait(1)
-        end
-        if not Alive or not (readHop() or {}).active then return end
-        if luck and luck >= st.target then
-            stopHop(("found! luck %s (was %.3g)"):format(findLuckText(), st.base))
-            notify("Lucky server found: " .. tostring(findLuckText()))
-        elseif (st.tries or 0) >= (st.max or 30) then
-            stopHop(("no lucky server in %d tries"):format(st.tries))
-        else
-            log(("Server finder: luck here %s, need %.3g - hopping"):format(tostring(findLuckText()), st.target))
-            task.wait(1)
-            if Alive and (readHop() or {}).active then hopNow(st) end
-        end
-    end
 end)
