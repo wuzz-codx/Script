@@ -1,5 +1,5 @@
 --[[
-    MAX HUB  |  Anime Dice  |  V1.2
+    MAX HUB  |  Anime Dice  |  V1.3
 
     Record & Replay engine: tap RECORD, then tap the game's own button once.
     The hub captures exactly what the game sends and replays it, so it keeps
@@ -35,7 +35,7 @@ local TweenService = game:GetService("TweenService")
 local LP        = Players.LocalPlayer
 local PlayerGui = LP:WaitForChild("PlayerGui")
 
-local VERSION     = "1.2"
+local VERSION     = "1.3"
 local CONFIG_FILE = "MaxHub_AnimeDice.json"
 local SCAN_FILE   = "MaxHub_Scan.txt"
 local CATS        = { "Grade", "Trait", "Quirk" }
@@ -78,6 +78,8 @@ local Cfg = {
     Delay = 0.35, MaxUnread = 8, MaxNoChange = 10,
     AntiAFK = true, Protect = true, PauseFarm = true, Spy = false,
     BoostEvery = 0, -- minutes, 0 = only when a luck session starts
+    HopPct = 50,    -- server finder: need this % more luck than now
+    HopMax = 30,    -- server finder: give up after N servers
     Grade = { Target = "Z+",      OrBetter = true, MaxLuck = true, Custom = "", Unit = nil },
     Trait = { Target = "Eternal", OrBetter = true, MaxLuck = true, Custom = "", Unit = nil },
     Quirk = { Target = "",        OrBetter = true, MaxLuck = true, Custom = "", Unit = nil },
@@ -516,18 +518,60 @@ local function readUnitData(cat, inst)
     if loose and cat == "Trait" then return loose[1], loose[2] end
 end
 
-local function unitLabel(inst)
-    local name
-    for _, k in ipairs(UNIT_LABEL_KEYS) do
-        local a = inst:GetAttribute(k)
-        if type(a) == "string" and a ~= "" then name = a break end
-        local c = inst:FindFirstChild(k)
-        if c and c:IsA("StringValue") and c.Value ~= "" then name = c.Value break end
+-- Units are often stored under numeric IDs; dig out a real character name.
+local GENERIC_NAMES = { folder = true, model = true, data = true, stats = true, value = true, unit = true, units = true,
+    inventory = true, ["true"] = true, ["false"] = true, none = true, default = true }
+
+local function isNameLike(s)
+    if type(s) ~= "string" then return false end
+    s = clean(s)
+    if #s < 2 or #s > 30 then return false end
+    if not s:match("^%a[%a%s%.'%-_]*%d?$") then return false end
+    if GENERIC_NAMES[s:lower()] then return false end
+    for _, cat in ipairs(CATS) do
+        if exactName(s, Data[cat]) then return false end
     end
-    name = name or inst.Name
-    if #name > 22 then name = name:sub(1, 20) .. ".." end
-    local tr = readUnitData("Trait", inst)
-    return tr and (name .. " [" .. tr .. "]") or name
+    return true
+end
+
+local function keyScore(k)
+    k = tostring(k):lower()
+    for i, w in ipairs(UNIT_LABEL_KEYS) do
+        if k:find(w:lower(), 1, true) then return 20 - i end
+    end
+    if k:find("type", 1, true) or k:find("species", 1, true) or k:find("base", 1, true) then return 5 end
+    return 0
+end
+
+local function unitName(inst)
+    local best, bestScore = nil, -1
+    local function consider(k, v)
+        if isNameLike(v) then
+            local s = keyScore(k)
+            if s > bestScore then best, bestScore = clean(v), s end
+        end
+    end
+    for k, v in pairs(inst:GetAttributes()) do consider(k, v) end
+    for _, d in ipairs(inst:GetDescendants()) do
+        if d:IsA("StringValue") then consider(d.Name, d.Value) end
+        for k, v in pairs(d:GetAttributes()) do consider(k, v) end
+    end
+    if best then return best end
+    if isNameLike(inst.Name) then return inst.Name end
+    for _, ch in ipairs(inst:GetChildren()) do
+        if (ch:IsA("Model") or ch:IsA("Folder") or ch:IsA("Configuration")) and isNameLike(ch.Name) then return ch.Name end
+    end
+end
+
+local function unitLabel(inst, idx)
+    local name = unitName(inst) or ("Unit #" .. tostring(idx or inst.Name))
+    if #name > 20 then name = name:sub(1, 18) .. ".." end
+    local tags = {}
+    for _, cat in ipairs(CATS) do
+        local n = readUnitData(cat, inst)
+        if n then table.insert(tags, n) end
+    end
+    return #tags > 0 and (name .. " [" .. table.concat(tags, "|") .. "]") or name
 end
 
 local ID_ATTRS = { "Id", "ID", "UID", "Uid", "UUID", "GUID", "Guid" }
@@ -538,7 +582,7 @@ local function findUnitPool(value)
         if not p then return nil end
         local out = {}
         for _, c in ipairs(p:GetChildren()) do
-            if c.ClassName == value.ClassName then table.insert(out, { value = c, inst = c, label = unitLabel(c) }) end
+            if c.ClassName == value.ClassName then table.insert(out, { value = c, inst = c }) end
         end
         return out
     end
@@ -547,14 +591,14 @@ local function findUnitPool(value)
         for _, d in ipairs(root:GetDescendants()) do
             if d.Name == value and d.Parent then
                 local out = {}
-                for _, c in ipairs(d.Parent:GetChildren()) do table.insert(out, { value = c.Name, inst = c, label = unitLabel(c) }) end
+                for _, c in ipairs(d.Parent:GetChildren()) do table.insert(out, { value = c.Name, inst = c }) end
                 return out
             end
             if d:IsA("StringValue") and d.Value == value and d.Parent and d.Parent.Parent then
                 local key, out = d.Name, {}
                 for _, c in ipairs(d.Parent.Parent:GetChildren()) do
                     local v = c:FindFirstChild(key)
-                    if v and v:IsA("StringValue") then table.insert(out, { value = v.Value, inst = c, label = unitLabel(c) }) end
+                    if v and v:IsA("StringValue") then table.insert(out, { value = v.Value, inst = c }) end
                 end
                 return out
             end
@@ -563,7 +607,7 @@ local function findUnitPool(value)
                     local out = {}
                     for _, c in ipairs(d.Parent:GetChildren()) do
                         local cv = c:GetAttribute(a)
-                        if cv ~= nil then table.insert(out, { value = cv, inst = c, label = unitLabel(c) }) end
+                        if cv ~= nil then table.insert(out, { value = cv, inst = c }) end
                     end
                     return out
                 end
@@ -610,8 +654,8 @@ local function currentUnit(cat)
     local want = deser(Cfg[cat].Unit)
     if want == nil then want = rec.unit.value end
     if pool then
-        for _, e in ipairs(pool) do
-            if sameValue(e.value, want) then return e.value, e.inst end
+        for i, e in ipairs(pool) do
+            if sameValue(e.value, want) then return e.value, e.inst, e, i end
         end
     end
     return want, nil
@@ -619,7 +663,9 @@ end
 
 local function refreshPool(cat)
     local rec = Recipes[cat]
-    Pools[cat] = (rec and rec.unit and findUnitPool(rec.unit.value)) or {}
+    local pool = (rec and rec.unit and findUnitPool(rec.unit.value)) or {}
+    for i, e in ipairs(pool) do e.label = unitLabel(e.inst, i) end
+    Pools[cat] = pool
 end
 
 -- Load saved recipes
@@ -718,6 +764,24 @@ local function findLuckText()
         end
     end
     return best
+end
+
+local LUCK_SUFFIX = {
+    k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, qd = 1e15, qi = 1e18, qn = 1e18,
+    sx = 1e21, sp = 1e24, oc = 1e27, no = 1e30, dc = 1e33,
+}
+local function parseLuck(t)
+    if not t then return nil end
+    local s = (t:lower():gsub(",", ""))
+    local num, suf = s:match("x([%d%.]+)(%a*)")
+    num = tonumber(num)
+    if not num then return nil end
+    if suf ~= "" then
+        local mult = LUCK_SUFFIX[suf]
+        if not mult then return nil end
+        num *= mult
+    end
+    return num
 end
 
 ------------------------------------------------------------------------
@@ -1228,7 +1292,7 @@ local function runSession(cat)
 
     Running = cat
     refreshCatUI(cat)
-    log(("%s roll started -> %s%s"):format(cat, tgt, unitInst and (" on " .. unitLabel(unitInst)) or ""))
+    log(("%s roll started -> %s%s"):format(cat, tgt, unitInst and (" on " .. unitLabel(unitInst, select(4, currentUnit(cat)))) or ""))
 
     if Cfg.Protect then
         local n, r
@@ -1377,6 +1441,86 @@ track(UIS.InputBegan:Connect(function(input)
 end))
 
 ------------------------------------------------------------------------
+-- Server finder: hop until the shown luck is higher (luck events/weather)
+------------------------------------------------------------------------
+local TeleportService = game:GetService("TeleportService")
+local HOP_FILE = "MaxHub_Hop.json"
+local LOADER = 'loadstring(game:HttpGet("https://raw.githubusercontent.com/wuzz-codx/Script/main/script1.lua"))()'
+
+local function readHop()
+    if not (isfile and readfile) then return nil end
+    local ok, t = pcall(function()
+        if isfile(HOP_FILE) then return HttpService:JSONDecode(readfile(HOP_FILE)) end
+    end)
+    return ok and type(t) == "table" and t or nil
+end
+
+local function writeHop(t)
+    if writefile then pcall(writefile, HOP_FILE, HttpService:JSONEncode(t)) end
+end
+
+local function stopHop(reason)
+    local st = readHop()
+    if st and st.active then
+        st.active = false
+        writeHop(st)
+    end
+    if reason then log("Server finder: " .. reason) setStatus("Server finder: " .. reason) end
+end
+
+local function hopNow(st)
+    st.tries = (st.tries or 0) + 1
+    st.visited = st.visited or {}
+    st.visited[game.JobId] = true
+    writeHop(st)
+
+    local servers = {}
+    local ok, body = pcall(function()
+        return game:HttpGet(("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true"):format(game.PlaceId))
+    end)
+    if ok then
+        local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
+        if ok2 and type(data) == "table" and type(data.data) == "table" then
+            for _, s in ipairs(data.data) do
+                if s.id ~= game.JobId and not st.visited[s.id] and (s.playing or 0) < (s.maxPlayers or 1) then
+                    table.insert(servers, s.id)
+                end
+            end
+        end
+    end
+
+    local qot = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+    if qot then pcall(qot, LOADER) end
+
+    log(("Server finder: hop %d/%d (%d servers listed)"):format(st.tries, st.max, #servers))
+    if #servers > 0 then
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, servers[math.random(1, #servers)], LP)
+    else
+        TeleportService:Teleport(game.PlaceId, LP)
+    end
+end
+
+local function startHop()
+    local base = parseLuck(findLuckText())
+    if not base then
+        setStatus("Server finder: can't read your luck (the x... number on screen)")
+        return
+    end
+    local st = { active = true, base = base, target = base * (1 + Cfg.HopPct / 100), tries = 0, max = Cfg.HopMax, visited = {} }
+    log(("Server finder: luck now %s, looking for %.3g+"):format(findLuckText(), st.target))
+    hopNow(st)
+end
+
+track(TeleportService.TeleportInitFailed:Connect(function(player)
+    if player ~= LP then return end
+    local st = readHop()
+    if st and st.active then
+        log("Server finder: teleport failed, retrying")
+        task.delay(3, function() if Alive then hopNow(st) end end)
+    end
+end))
+
+------------------------------------------------------------------------
 -- Pages
 ------------------------------------------------------------------------
 local LuckLabel
@@ -1392,6 +1536,7 @@ do
     local stopAll = button(s, "STOP EVERYTHING", Theme.Bad)
     stopAll.Activated:Connect(function()
         stopRoll("stop all")
+        stopHop()
         for _, slot in ipairs(FARM_SLOTS) do Cfg.Farm[slot.key].On = false end
         for _, f in ipairs(genv.MaxHubFarmRenders or {}) do f() end
         setStatus("Everything stopped")
@@ -1440,6 +1585,17 @@ do
     stepper(b, "Re-use boosts every (min)", function() return Cfg.BoostEvery end, function(v) Cfg.BoostEvery = v end, 1, 0, 60, "%d")
 end
 
+do
+    local h = card(PLuck)
+    label(h, "Server Finder", 15, Theme.Accent, true)
+    label(h, "Every server has the same base odds. This hops servers until your shown luck is higher (luck event / weather active), then stops so you can roll there.", 11, Theme.Sub)
+    stepper(h, "Need more luck than now (%)", function() return Cfg.HopPct end, function(v) Cfg.HopPct = v end, 10, 10, 1000, "+%d%%")
+    stepper(h, "Max servers to try", function() return Cfg.HopMax end, function(v) Cfg.HopMax = v end, 5, 5, 200, "%d")
+    local r = hrow(h, 32)
+    smallBtn(r, "FIND LUCKY SERVER", 0.6, Theme.On).Activated:Connect(startHop)
+    smallBtn(r, "Stop", 0.4, Theme.Bad).Activated:Connect(function() stopHop("stopped by you") end)
+end
+
 local function buildLuck(cat)
     local c = card(PLuck)
     label(c, cat .. " Luck", 15, Theme.Accent, true)
@@ -1449,9 +1605,12 @@ local function buildLuck(cat)
         local rec = Recipes[cat]
         if not rec then return "(record a roll first)" end
         if not rec.unit then return "(as recorded - re-record to change)" end
-        local _, inst = currentUnit(cat)
-        if inst then return unitLabel(inst) .. "  (" .. #(Pools[cat] or {}) .. ")" end
-        return short(rec.unit.value)
+        local _, inst, entry, idx = currentUnit(cat)
+        if inst then
+            entry.label = unitLabel(inst, idx)
+            return ("%d/%d  %s"):format(idx, #Pools[cat], entry.label)
+        end
+        return "As recorded (ID " .. short(rec.unit.value) .. ") - tap Units"
     end, function(d)
         local pool = Pools[cat] or {}
         if #pool == 0 then refreshPool(cat) pool = Pools[cat] end
@@ -1725,4 +1884,27 @@ task.spawn(function()
     if not HookOK then log("Recorder unavailable: executor lacks hookmetamethod") end
     local exec = identifyexecutor and identifyexecutor() or "executor"
     setStatus("Ready | " .. tostring(exec) .. " | build " .. game.PlaceVersion)
+
+    -- Continue a server-finder run after teleporting
+    local st = readHop()
+    if st and st.active then
+        setStatus("Server finder: checking this server...")
+        local luck
+        for _ = 1, 15 do -- give the HUD up to ~15s to load
+            luck = parseLuck(findLuckText())
+            if luck then break end
+            task.wait(1)
+        end
+        if not Alive or not (readHop() or {}).active then return end
+        if luck and luck >= st.target then
+            stopHop(("found! luck %s (was %.3g)"):format(findLuckText(), st.base))
+            notify("Lucky server found: " .. tostring(findLuckText()))
+        elseif (st.tries or 0) >= (st.max or 30) then
+            stopHop(("no lucky server in %d tries"):format(st.tries))
+        else
+            log(("Server finder: luck here %s, need %.3g - hopping"):format(tostring(findLuckText()), st.target))
+            task.wait(1)
+            if Alive and (readHop() or {}).active then hopNow(st) end
+        end
+    end
 end)
