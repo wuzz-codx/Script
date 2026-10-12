@@ -1,5 +1,5 @@
 --[[
-    MAX HUB  |  Anime Dice  |  V1.5
+    MAX HUB  |  Anime Dice  |  V1.6
 
     Record & Replay engine: tap RECORD, then tap the game's own button once.
     The hub captures exactly what the game sends and replays it, so it keeps
@@ -35,7 +35,7 @@ local TweenService = game:GetService("TweenService")
 local LP        = Players.LocalPlayer
 local PlayerGui = LP:WaitForChild("PlayerGui")
 
-local VERSION     = "1.5"
+local VERSION     = "1.6"
 local CONFIG_FILE = "MaxHub_AnimeDice.json"
 local SCAN_FILE   = "MaxHub_Scan.txt"
 local CATS        = { "Grade", "Trait", "Quirk" }
@@ -61,11 +61,19 @@ local ROLL_WORDS     = { "reroll", "re%-roll", "roll", "spin" }
 local ROLL_EXCLUDE   = { "auto", "stop", "buy", "robux", "r%$", "skip", "jackpot" }
 local LEARN_HINT     = { Trait = { "trait", "reroll", "roll" }, Grade = { "grade", "reroll", "roll" }, Quirk = { "quirk", "reroll", "roll" } }
 
+-- builtin = game remotes found in the scan (Network.<Service>.<RE|RF>.<Name>), called with no arguments
 local FARM_SLOTS = {
-    { key = "Roll",    name = "Auto Roll Units",  interval = 0.5, fallback = "ROLL",  hint = "Tap the big ROLL dice" },
-    { key = "Rebirth", name = "Auto Rebirth",     interval = 30,  hint = "Open Rebirth and tap the rebirth button" },
-    { key = "Upgrade", name = "Auto Upgrade",     interval = 3,   hint = "Open UPGRADES and tap an upgrade" },
-    { key = "Claim",   name = "Auto Claim",       interval = 60,  fallback = "CLAIM", hint = "Tap Claim (daily / rewards)" },
+    { key = "Roll",      name = "Auto Roll Units",    interval = 0.5, fallback = "ROLL", hint = "Tap the big ROLL dice",
+      builtin = { { "RollService", "RF", "RollDice" } } },
+    { key = "Collect",   name = "Auto Collect Cash",  interval = 10, hint = "Collect the cash on your plot",
+      builtin = { { "PlotService", "RE", "CollectBalance" } } },
+    { key = "EquipBest", name = "Auto Equip Best",    interval = 30, hint = "Tap Equip Best",
+      builtin = { { "PlotService", "RE", "EquipBest" } } },
+    { key = "Upgrade",   name = "Auto Buy Upgrades",  interval = 3,  hint = "Open UPGRADES and buy ONE upgrade (e.g. a Luck one)" },
+    { key = "Rebirth",   name = "Auto Rebirth",       interval = 30, hint = "Open Rebirth and tap the rebirth button",
+      builtin = { { "RebirthService", "RE", "Rebirth" } } },
+    { key = "Claim",     name = "Auto Claim Rewards", interval = 60, fallback = "CLAIM", hint = "Tap Claim (daily / rewards)",
+      builtin = { { "DailyRewardService", "RE", "Claim" }, { "OfflineEarningsService", "RE", "Claim" }, { "GroupRewardService", "RE", "Claim" } } },
     { key = "Quest",   name = "Auto Quest",       interval = 10,  hint = "Open Quests and tap claim / start" },
     { key = "Custom1", name = "Custom Macro 1",   interval = 5,   hint = "Tap any game button to repeat" },
     { key = "Custom2", name = "Custom Macro 2",   interval = 5,   hint = "Tap any game button to repeat" },
@@ -78,6 +86,7 @@ local Cfg = {
     Delay = 0.35, MaxUnread = 8, MaxNoChange = 10,
     AntiAFK = true, Protect = true, PauseFarm = true, Spy = false, Turbo = true,
     BoostEvery = 0, -- minutes, 0 = only when a luck session starts
+    UpgradeFilter = "Luck", -- Auto Buy Upgrades: only upgrades whose name has one of these words
     Grade = { Target = "Z+",      OrBetter = true, MaxLuck = true, Custom = "", Unit = nil },
     Trait = { Target = "Eternal", OrBetter = true, MaxLuck = true, Custom = "", Unit = nil },
     Quirk = { Target = "",        OrBetter = true, MaxLuck = true, Custom = "", Unit = nil },
@@ -348,7 +357,10 @@ local function describeCall(remote, method, args)
     local parts = {}
     for i = 1, math.min(args.n, 5) do table.insert(parts, short(args[i])) end
     if args.n > 5 then table.insert(parts, "...") end
-    return ("%s:%s(%s)"):format(remote.Name, method == "InvokeServer" and "Invoke" or "Fire", table.concat(parts, ", "))
+    local name = remote.Name
+    local p = remote.Parent
+    if p and (p.Name == "RE" or p.Name == "RF" or p.Name == "RP") and p.Parent then name = p.Parent.Name .. "." .. name end
+    return ("%s:%s(%s)"):format(name, method == "InvokeServer" and "Invoke" or "Fire", table.concat(parts, ", "))
 end
 
 ------------------------------------------------------------------------
@@ -493,32 +505,9 @@ local function playRecipe(rec, unitValue)
 end
 
 -- Units ------------------------------------------------------------------
-
-local function readUnitData(cat, inst)
-    if not inst or not inst.Parent then return nil end
-    local list = Data[cat]
-    if #list == 0 then return nil end
-    local kw = cat:lower()
-    local loose
-    local function check(key, val)
-        local n, r = exactName(val, list)
-        if n then
-            if key:lower():find(kw, 1, true) then return n, r end
-            loose = loose or { n, r }
-        end
-    end
-    for k, v in pairs(inst:GetAttributes()) do
-        local n, r = check(k, v)
-        if n then return n, r end
-    end
-    for _, d in ipairs(inst:GetDescendants()) do
-        if d:IsA("StringValue") then
-            local n, r = check(d.Name, d.Value)
-            if n then return n, r end
-        end
-    end
-    if loose and cat == "Trait" then return loose[1], loose[2] end
-end
+-- Anime Dice keeps your units in memory (sent by the server), keyed by a
+-- GUID like "72e49e49-1e2c-40fe-...". Trait/Grade/Quirk rolls are
+-- Network.<Trait|Grade|Quirk>Service.RE.Roll:FireServer(unitGuid).
 
 -- Anime Dice unit names (Update 5/6). Extra names are learned from the game.
 local KNOWN_UNITS = {
@@ -530,7 +519,13 @@ local KNOWN_UNITS = {
 local COPY_TAGS = { classic = "Classic", normal = "Normal", silver = "Silver", gold = "Gold", golden = "Gold",
     emerald = "Emerald", diamond = "Diamond", ruby = "Ruby", rainbow = "Rainbow", shiny = "Shiny",
     huge = "Huge", titanic = "Titanic", big = "Big" }
-local BAD_NAME_KEYS = { "mutation", "variant", "size", "dice", "rarity", "tier", "type", "grade", "trait", "quirk", "owner", "id" }
+local BAD_NAME_KEYS = { "mutation", "variant", "size", "dice", "rarity", "tier", "type", "grade", "trait", "quirk", "owner", "id", "uuid", "key" }
+local ID_ATTRS = { "Id", "ID", "UID", "Uid", "UUID", "GUID", "Guid", "UnitId", "UnitID", "Key" }
+local ID_KEYS = { "Id", "ID", "id", "UUID", "Uuid", "uuid", "Guid", "GUID", "guid", "UnitId", "UnitID", "unitId", "Key", "key" }
+local STAT_FOLDERS = { stats = true, data = true, info = true, traits = true, attributes = true, values = true, properties = true, config = true }
+local GUID_PAT = "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$"
+
+local function isGuid(s) return type(s) == "string" and s:match(GUID_PAT) ~= nil end
 
 local KnownSet = {}
 local function addKnown(n)
@@ -538,7 +533,7 @@ local function addKnown(n)
 end
 for _, n in ipairs(KNOWN_UNITS) do addKnown(n) end
 
--- Learn every unit name the game ships (folders/modules named Units, Characters...)
+-- Learn every unit name the game ships (folders named Units, Characters...)
 local function learnUnitNames()
     local before = 0
     for _ in pairs(KnownSet) do before += 1 end
@@ -559,8 +554,7 @@ local function knownName(v)
     if type(v) ~= "string" then return nil end
     local t = clean(v):lower()
     if KnownSet[t] then return KnownSet[t] end
-    -- "Goko_Gold", "Shiny Goko", "Goko2" ...
-    for low, real in pairs(KnownSet) do
+    for low, real in pairs(KnownSet) do -- "Goko_Gold", "Shiny Goko" ...
         if #low >= 4 and t:find(low, 1, true) then return real end
     end
 end
@@ -587,26 +581,66 @@ local function badKey(k)
     return false
 end
 
--- Every (key, string) pair stored on a unit: attributes, StringValues, child names
-local function unitStrings(inst)
-    local out = { { "__name", inst.Name } }
-    for k, v in pairs(inst:GetAttributes()) do
-        if type(v) == "string" then table.insert(out, { k, v }) end
+-- Every (key, string) pair we know about a unit, from memory / screen / instances
+local function entryStrings(e)
+    local out = {}
+    if e.tbl then
+        for k, v in next, e.tbl do
+            if type(v) == "string" then
+                table.insert(out, { tostring(k), v })
+            elseif type(v) == "table" then
+                for k2, v2 in next, v do
+                    if type(v2) == "string" then table.insert(out, { tostring(k) .. "." .. tostring(k2), v2 }) end
+                end
+            end
+        end
     end
-    for _, d in ipairs(inst:GetDescendants()) do
-        if d:IsA("StringValue") then table.insert(out, { d.Name, d.Value }) end
-        for k, v in pairs(d:GetAttributes()) do
+    if e.gui and e.gui.Parent then
+        for _, d in ipairs(e.gui:GetDescendants()) do
+            if d:IsA("TextLabel") then table.insert(out, { d.Name, clean(d.Text) }) end
+        end
+    end
+    if e.inst and e.inst.Parent then
+        local inst = e.inst
+        table.insert(out, { "__name", inst.Name })
+        for k, v in pairs(inst:GetAttributes()) do
             if type(v) == "string" then table.insert(out, { k, v }) end
         end
-        if d.Parent == inst and (d:IsA("Model") or d:IsA("Folder") or d:IsA("Configuration")) then
-            table.insert(out, { "__child", d.Name })
+        for _, d in ipairs(inst:GetDescendants()) do
+            if d:IsA("StringValue") then table.insert(out, { d.Name, d.Value }) end
+            for k, v in pairs(d:GetAttributes()) do
+                if type(v) == "string" then table.insert(out, { k, v }) end
+            end
+            if d.Parent == inst and (d:IsA("Model") or d:IsA("Folder") or d:IsA("Configuration")) then
+                table.insert(out, { "__child", d.Name })
+            end
         end
     end
     return out
 end
 
-local function unitName(inst)
-    local strs = unitStrings(inst)
+-- Current Trait / Grade / Quirk of a unit
+local function readStrings(cat, strs)
+    local list = Data[cat]
+    if #list == 0 then return nil end
+    local kw, loose = cat:lower(), nil
+    for _, kv in ipairs(strs) do
+        local n, r = exactName(kv[2], list)
+        if n then
+            if kv[1]:lower():find(kw, 1, true) then return n, r end
+            loose = loose or { n, r }
+        end
+    end
+    if loose and cat == "Trait" then return loose[1], loose[2] end
+end
+
+local function readEntry(cat, e)
+    if not e then return nil end
+    return readStrings(cat, entryStrings(e))
+end
+
+local function entryName(e, strs)
+    strs = strs or entryStrings(e)
     for _, kv in ipairs(strs) do -- 1) a real Anime Dice unit name anywhere
         local n = knownName(kv[2])
         if n then return n end
@@ -615,7 +649,7 @@ local function unitName(inst)
     for _, kv in ipairs(strs) do
         local k, v = kv[1], kv[2]
         if isNameLike(v) and not badKey(k) then
-            local kl = tostring(k):lower()
+            local kl = k:lower()
             local score = (kl:find("name", 1, true) or kl:find("unit", 1, true) or kl:find("char", 1, true) or kl:find("hero", 1, true)) and 10
                 or (k == "__child" and 3) or (k == "__name" and 2) or 1
             if score > bestScore then best, bestScore = clean(v), score end
@@ -624,65 +658,102 @@ local function unitName(inst)
     return best
 end
 
-local function copyTags(inst)
+local function entryLabel(e, idx)
+    local strs = entryStrings(e)
+    local name = entryName(e, strs) or ("Unit " .. tostring(idx or "?"))
+    if #name > 18 then name = name:sub(1, 16) .. ".." end
     local tags, seen = {}, {}
-    for _, kv in ipairs(unitStrings(inst)) do
-        local v = type(kv[2]) == "string" and clean(kv[2]):lower() or ""
-        local tag = COPY_TAGS[v]
+    for _, kv in ipairs(strs) do
+        local tag = COPY_TAGS[clean(kv[2]):lower()]
         if tag and tag ~= "Classic" and tag ~= "Normal" and not seen[tag] then
             seen[tag] = true
             table.insert(tags, tag)
         end
     end
-    return tags
-end
-
-local function unitLabel(inst, idx)
-    local name = unitName(inst) or ("Unit " .. tostring(idx or "?"))
-    if #name > 18 then name = name:sub(1, 16) .. ".." end
-    local tags = copyTags(inst)
     if #tags > 0 then name = name .. " (" .. table.concat(tags, ", ") .. ")" end
     local stats = {}
     for _, cat in ipairs(CATS) do
-        local n = readUnitData(cat, inst)
+        local n = readStrings(cat, strs)
         if n then table.insert(stats, n) end
     end
     return #stats > 0 and (name .. " [" .. table.concat(stats, "|") .. "]") or name
 end
 
-local ID_ATTRS = { "Id", "ID", "UID", "Uid", "UUID", "GUID", "Guid", "UnitId", "UnitID", "Key" }
-local STAT_FOLDERS = { stats = true, data = true, info = true, traits = true, attributes = true, values = true, properties = true, config = true }
-
--- Units (shared by Grade / Trait / Quirk). Each entry: { inst, label, value? }
+-- Units (shared by Grade / Trait / Quirk)
+-- entry = { id = guid?, tbl = memory table?, gui = backpack tile?, inst = Instance?, value = recorded id?, label }
 local Units, UnitsFrom = {}, "not scanned"
 
--- Ways a remote might identify a unit
-local function unitIds(e)
-    local inst = e.inst
-    local out = { { "inst", inst }, { "name", inst.Name } }
-    for _, a in ipairs(ID_ATTRS) do
-        local v = inst:GetAttribute(a)
-        if v ~= nil then table.insert(out, { "attr:" .. a, v }) end
-        local c = inst:FindFirstChild(a)
-        if c and c:IsA("ValueBase") then table.insert(out, { "val:" .. a, c.Value }) end
+local function guidOfTbl(v)
+    for _, k in ipairs(ID_KEYS) do
+        local x = rawget(v, k)
+        if isGuid(x) then return x end
     end
-    if e.value ~= nil then table.insert(out, { "legacy", e.value }) end
+end
+
+local function unitish(v)
+    for k, x in next, v do
+        if type(x) == "string" then
+            if knownName(x) or exactName(x, Data.Trait) then return true end
+            if type(k) == "string" and (k:lower():find("grade", 1, true) or k:lower():find("quirk", 1, true)) then return true end
+        end
+    end
+    return false
+end
+
+-- 1) The game's own unit table in memory (needs getgc - Delta has it)
+local function scanMemory()
+    if not getgc then return nil end
+    local ok, objs = pcall(getgc, true)
+    if not ok or type(objs) ~= "table" then return nil end
+    local cands = {}
+    pcall(function()
+        for _, t in ipairs(objs) do
+            if type(t) == "table" then
+                local n, seen = 0, 0
+                for k, v in next, t do
+                    seen += 1
+                    if seen > 30 then break end
+                    if type(v) == "table" and (isGuid(k) or guidOfTbl(v)) and unitish(v) then n += 1 end
+                end
+                if n >= 1 then table.insert(cands, t) end
+            end
+        end
+    end)
+    local best, bestMap, bestN = nil, nil, 0
+    for _, t in ipairs(cands) do
+        local map, n = {}, 0
+        pcall(function()
+            for k, v in next, t do
+                if type(v) == "table" then
+                    local id = isGuid(k) and k or guidOfTbl(v)
+                    if id then map[id] = v n += 1 end
+                end
+            end
+        end)
+        if n > bestN then best, bestMap, bestN = t, map, n end
+    end
+    return best and bestMap or nil
+end
+
+-- 2) Backpack / trait-menu tiles named (or tagged) with the unit GUID
+local function scanTiles()
+    local out = {}
+    for _, d in ipairs(PlayerGui:GetDescendants()) do
+        if d:IsA("GuiObject") and not (Hub and d:IsDescendantOf(Hub)) then
+            local id = isGuid(d.Name) and d.Name or nil
+            if not id then
+                for _, a in ipairs(ID_ATTRS) do
+                    local v = d:GetAttribute(a)
+                    if isGuid(v) then id = v break end
+                end
+            end
+            if id and not out[id] then out[id] = d end
+        end
+    end
     return out
 end
 
-local function idOf(e, kind)
-    if not e then return nil end
-    if kind == "inst" then return e.inst end
-    if kind == "name" then return e.inst.Name end
-    if kind == "legacy" then return e.value end
-    local how, a = tostring(kind):match("^(%a+):(.+)$")
-    if how == "attr" then return e.inst:GetAttribute(a) end
-    if how == "val" then
-        local c = e.inst:FindFirstChild(a)
-        return c and c.Value
-    end
-end
-
+-- 3) Generic: instances carrying trait/grade values (other games / old layouts)
 local function isMarker(key, val)
     if type(val) ~= "string" then return false end
     for _, cat in ipairs(CATS) do
@@ -693,110 +764,75 @@ local function isMarker(key, val)
     return false
 end
 
-local function unitOfMarker(m)
-    local u = m:IsA("ValueBase") and m.Parent or m
-    while u and u.Parent and STAT_FOLDERS[u.Name:lower()] do u = u.Parent end
-    return u
-end
-
-local function ownerScore(cont)
-    local me, uid = LP.Name:lower(), tostring(LP.UserId)
-    local cur = cont
-    while cur and cur ~= game do
-        local n = cur.Name:lower()
-        if n == me or n:find(uid, 1, true) then return 1000 end
-        local o = cur:GetAttribute("Owner") or cur:GetAttribute("Player") or cur:GetAttribute("UserId")
-        if o ~= nil then
-            if tostring(o):lower() == me or tostring(o) == uid then return 1000 end
-            return -1 -- someone else's
-        end
-        local p = Players:FindFirstChild(cur.Name)
-        if p and p ~= LP then return -1 end
-        cur = cur.Parent
-    end
-    return 0
-end
-
--- Find the player's unit inventory by looking for trait/grade values
-local function scanUnits()
+local function scanInstances()
     local counts, units = {}, {}
     local function consider(u)
+        while u and u.Parent and STAT_FOLDERS[u.Name:lower()] do u = u.Parent end
         if not u or not u.Parent or units[u] then return end
         units[u] = true
         counts[u.Parent] = (counts[u.Parent] or 0) + 1
     end
-    -- byName: inside the player's own data a unit-name value also marks a unit
-    local function scan(root, byName)
-        for _, d in ipairs(root:GetDescendants()) do
-            for k, v in pairs(d:GetAttributes()) do
-                if isMarker(k, v) or (byName and knownName(v) and not badKey(k)) then consider(d) break end
-            end
-            if d:IsA("StringValue") and (isMarker(d.Name, d.Value) or (byName and knownName(d.Value) and not badKey(d.Name))) then
-                consider(unitOfMarker(d))
+    for _, ch in ipairs(LP:GetChildren()) do
+        if not ch:IsA("PlayerGui") and not ch:IsA("PlayerScripts") then
+            for _, d in ipairs(ch:GetDescendants()) do
+                for k, v in pairs(d:GetAttributes()) do
+                    if isMarker(k, v) then consider(d) break end
+                end
+                if d:IsA("StringValue") and isMarker(d.Name, d.Value) then consider(d.Parent) end
             end
         end
     end
-    for _, ch in ipairs(LP:GetChildren()) do
-        if not ch:IsA("PlayerGui") and not ch:IsA("PlayerScripts") then scan(ch, true) end
-    end
-    scan(RS)
-    if not next(counts) then scan(workspace) end
-
-    local best, bestScore = nil, -math.huge
+    local best, bc = nil, 0
     for cont, n in pairs(counts) do
-        local own = ownerScore(cont)
-        if own >= 0 and n + own > bestScore then best, bestScore = cont, n + own end
+        if n > bc then best, bc = cont, n end
     end
     if not best then return nil end
-
     local cls
     for u in pairs(units) do if u.Parent == best then cls = u.ClassName break end end
     local out = {}
     for _, c in ipairs(best:GetChildren()) do
         if c.ClassName == cls then table.insert(out, { inst = c }) end
     end
-    return out, best
+    return out, best:GetFullName()
 end
 
--- Fallback: build the unit list from the unit argument of a recorded roll
-local function poolFromValue(value)
-    if typeof(value) == "Instance" then
-        local p = value.Parent
-        if not p then return nil end
-        local out = {}
-        for _, c in ipairs(p:GetChildren()) do
-            if c.ClassName == value.ClassName then table.insert(out, { inst = c, value = c }) end
-        end
-        return out
-    end
-    if type(value) ~= "string" or #value < 3 then return nil end
-    for _, root in ipairs({ LP, RS }) do
-        for _, d in ipairs(root:GetDescendants()) do
-            if d.Name == value and d.Parent then
-                local out = {}
-                for _, c in ipairs(d.Parent:GetChildren()) do table.insert(out, { inst = c, value = c.Name }) end
-                return out
-            end
-            if d:IsA("StringValue") and d.Value == value and d.Parent and d.Parent.Parent then
-                local key, out = d.Name, {}
-                for _, c in ipairs(d.Parent.Parent:GetChildren()) do
-                    local v = c:FindFirstChild(key)
-                    if v and v:IsA("StringValue") then table.insert(out, { inst = c, value = v.Value }) end
-                end
-                return out
-            end
-        end
+-- Find a unit's table inside any server payload (Network.RE.Data etc.)
+local function findInPayload(v, id, depth)
+    depth = depth or 0
+    if type(v) ~= "table" or depth > 6 then return nil end
+    local direct = rawget(v, id)
+    if type(direct) == "table" then return direct end
+    if guidOfTbl(v) == id then return v end
+    for _, x in next, v do
+        local r = findInPayload(x, id, depth + 1)
+        if r then return r end
     end
 end
 
-local function looksLikeUnit(v)
-    if typeof(v) == "Instance" then
-        return not (v:IsA("BaseRemoteEvent") or v:IsA("RemoteFunction") or v:IsA("Player")) and v.Parent ~= nil
+-- Ways a recorded remote might identify a unit
+local function unitIds(e)
+    local out = {}
+    if e.id then table.insert(out, { "id", e.id }) end
+    if e.inst then
+        table.insert(out, { "inst", e.inst })
+        table.insert(out, { "name", e.inst.Name })
+        for _, a in ipairs(ID_ATTRS) do
+            local v = e.inst:GetAttribute(a)
+            if v ~= nil then table.insert(out, { "attr:" .. a, v }) end
+        end
     end
-    if type(v) == "string" then
-        return #v >= 12 or (#v >= 4 and (v:find("%d") ~= nil or v:find("%-") ~= nil))
-    end
-    return false
+    if e.value ~= nil then table.insert(out, { "legacy", e.value }) end
+    return out
+end
+
+local function idOf(e, kind)
+    if not e then return nil end
+    if kind == "id" then return e.id end
+    if kind == "inst" then return e.inst end
+    if kind == "name" then return e.inst and e.inst.Name end
+    if kind == "legacy" then return e.value end
+    local a = tostring(kind):match("^attr:(.+)$")
+    if a and e.inst then return e.inst:GetAttribute(a) end
 end
 
 local function eachArg(rec, fn)
@@ -813,12 +849,16 @@ local function eachArg(rec, fn)
     end
 end
 
--- Which argument of the roll is the unit, and in which form?
-local KIND_RANK = { inst = 1, legacy = 2, name = 4 }
+-- Which argument of a recorded roll is the unit, and in which form?
+local KIND_RANK = { id = 1, inst = 1, legacy = 2, name = 4 }
 local function matchUnitArg(rec)
     local found, foundRank
     eachArg(rec, function(ci, i, k, a)
         if a == nil or type(a) == "boolean" or type(a) == "table" then return false end
+        if isGuid(a) then -- a GUID argument is always the unit in this game
+            found, foundRank = { ci = ci, i = i, k = k, kind = "id", value = a }, 1
+            return true
+        end
         for _, e in ipairs(Units) do
             for _, id in ipairs(unitIds(e)) do
                 if id[2] == a then
@@ -834,63 +874,100 @@ local function matchUnitArg(rec)
     return found
 end
 
-local function labelUnits()
-    for i, e in ipairs(Units) do e.label = unitLabel(e.inst, i) end
-end
-
 local function refreshUnits()
-    local list, from = scanUnits()
-    if list and #list > 0 then
-        Units, UnitsFrom = list, from:GetFullName()
-    else
-        -- fall back to whatever a recorded roll points at
-        Units, UnitsFrom = {}, "none found"
-        for _, cat in ipairs(CATS) do
-            local rec = Recipes[cat]
-            if rec then
-                local hit
-                eachArg(rec, function(_, _, _, a)
-                    if looksLikeUnit(a) then
-                        local pool = poolFromValue(a)
-                        if pool and #pool > 0 then hit = pool return true end
-                    end
-                end)
-                if hit then Units, UnitsFrom = hit, "recorded " .. cat .. " roll" break end
-            end
+    local byId, list = {}, {}
+    local mem = scanMemory()
+    for id, t in pairs(mem or {}) do
+        local e = { id = id, tbl = t }
+        byId[id] = e
+        table.insert(list, e)
+    end
+    local fromTiles = 0
+    for id, g in pairs(scanTiles()) do
+        if byId[id] then
+            byId[id].gui = g
+        else
+            local e = { id = id, gui = g }
+            byId[id] = e
+            table.insert(list, e)
+            fromTiles += 1
         end
     end
-    labelUnits()
+    -- unit GUIDs we have seen in recorded rolls (so the recorded unit is always listed)
     for _, cat in ipairs(CATS) do
         local rec = Recipes[cat]
-        if rec then rec.unit = matchUnitArg(rec) or rec.unit end
-    end
-    return #Units
-end
-
-local function entryByPath(path)
-    if type(path) ~= "table" then return nil end
-    for i, e in ipairs(Units) do
-        local p = instPath(e.inst)
-        if p and #p == #path then
-            local same = true
-            for j = 1, #p do if p[j] ~= path[j] then same = false break end end
-            if same then return e, i end
+        if rec then
+            eachArg(rec, function(_, _, _, a)
+                if isGuid(a) and not byId[a] then
+                    local e = { id = a }
+                    byId[a] = e
+                    table.insert(list, e)
+                end
+            end)
         end
     end
+    if mem and next(mem) then
+        UnitsFrom = "game memory"
+    elseif fromTiles > 0 then
+        UnitsFrom = "backpack screen"
+    elseif #list > 0 then
+        UnitsFrom = "recorded rolls"
+    else
+        local inst, from = scanInstances()
+        if inst then list, UnitsFrom = inst, from else UnitsFrom = "none found" end
+    end
+    for i, e in ipairs(list) do e.label = entryLabel(e, i) end
+    table.sort(list, function(a, b) return a.label < b.label end)
+    Units = list
+    for _, cat in ipairs(CATS) do
+        local rec = Recipes[cat]
+        if rec and not rec.builtin then rec.unit = matchUnitArg(rec) or rec.unit end
+    end
+    return #Units
 end
 
 -- Selected unit for a category: saved choice > unit in the recorded roll > first
 local function currentEntry(cat)
     if #Units == 0 then return nil end
-    local e, i = entryByPath(Cfg[cat].UnitPath)
-    if e then return e, i end
+    local want = Cfg[cat].UnitId
+    if want then
+        for i, e in ipairs(Units) do
+            if e.id == want or (e.inst and instPath(e.inst) and table.concat(instPath(e.inst), "/") == want) then return e, i end
+        end
+    end
     local rec = Recipes[cat]
-    if rec and rec.unit then
-        for j, x in ipairs(Units) do
-            if idOf(x, rec.unit.kind) == rec.unit.value then return x, j end
+    if rec and rec.unit and rec.unit.value ~= nil then
+        for i, e in ipairs(Units) do
+            if idOf(e, rec.unit.kind) == rec.unit.value then return e, i end
         end
     end
     return Units[1], 1
+end
+
+local function entryKey(e)
+    if e.id then return e.id end
+    local p = e.inst and instPath(e.inst)
+    return p and table.concat(p, "/") or nil
+end
+
+-- Built-in remotes from the game's Network folder (no recording needed)
+local function netRemote(service, kind, name)
+    local n = RS:FindFirstChild("Network")
+    local s = n and n:FindFirstChild(service)
+    local f = s and s:FindFirstChild(kind)
+    return f and f:FindFirstChild(name)
+end
+
+local ROLL_SERVICE = { Trait = "TraitService", Grade = "GradeService", Quirk = "QuirkService" }
+local function builtinRoll(cat)
+    local r = netRemote(ROLL_SERVICE[cat], "RE", "Roll")
+    if not r then return nil end
+    return {
+        calls = { { remote = r, method = "FireServer", args = { n = 1, "" } } },
+        unit = { ci = 1, i = 1, kind = "id" },
+        label = ROLL_SERVICE[cat] .. ".Roll(unit)",
+        builtin = true,
+    }
 end
 
 -- Load saved recipes
@@ -1367,7 +1444,10 @@ local function refreshCatUI(cat)
     end
     if r.Rec then
         local rec = Recipes[cat]
-        if not rec then
+        local b = builtinRoll(cat)
+        if b then
+            r.Rec.Text = ("Uses the game's %s directly. Units: %d (%s)"):format(b.label, #Units, UnitsFrom)
+        elseif not rec then
             r.Rec.Text = "Roll not learned yet: open the game's " .. cat .. "s menu and tap Roll once (the hub learns it by itself)."
         elseif rec.unit then
             r.Rec.Text = (rec.auto and "Learned automatically" or "Recorded") .. " - unit picker active. " .. rec.label
@@ -1445,8 +1525,8 @@ local function waitResult(cat, ctx)
         for _, e in ipairs(ctx.inbox) do
             if e.t >= ctx.t0 then return e.name, e.rank, true end
         end
-        if ctx.unitInst then
-            local n, r = readUnitData(cat, ctx.unitInst)
+        if ctx.unit then
+            local n, r = readEntry(cat, ctx.unit)
             if n and n ~= ctx.unitBefore then return n, r, true end
         end
         if ctx.label then
@@ -1464,8 +1544,8 @@ local function waitResult(cat, ctx)
         end
         task.wait(poll)
     end
-    if ctx.unitInst then
-        local n, r = readUnitData(cat, ctx.unitInst)
+    if ctx.unit then
+        local n, r = readEntry(cat, ctx.unit)
         if n then return n, r, false end
     end
     if ctx.label then
@@ -1480,7 +1560,13 @@ local function runSession(cat)
     local tgt = targetText(cat)
     if not tgt then setStatus("Pick a " .. cat .. " target first") return end
 
-    local rec = Recipes[cat]
+    if #Units == 0 then refreshUnits() end
+    local rec = builtinRoll(cat) or Recipes[cat]
+    if rec and rec.builtin and not (currentEntry(cat) or {}).id then
+        setStatus("No units found yet: open BACKPACK once, then tap Units")
+        notify("Open your BACKPACK once, then tap Units")
+        return
+    end
     local panel = findPanel(cat)
     local rollBtn
     if not rec then
@@ -1492,11 +1578,10 @@ local function runSession(cat)
         end
     end
     local label_ = resolve(Cfg.Bind[cat].Result)
-    if #Units == 0 then refreshUnits() end
-    local unitValue, unitInst, unitIdx = nil, nil, nil
+    local unitValue, unit, unitIdx = nil, nil, nil
     if rec and rec.unit then
         local e, i = currentEntry(cat)
-        if e then unitValue, unitInst, unitIdx = idOf(e, rec.unit.kind), e.inst, i end
+        if e then unitValue, unit, unitIdx = idOf(e, rec.unit.kind), e, i end
     end
 
     if #Data[cat] == 0 and not label_ then
@@ -1506,11 +1591,11 @@ local function runSession(cat)
 
     Running = cat
     refreshCatUI(cat)
-    log(("%s roll started -> %s%s"):format(cat, tgt, unitInst and (" on " .. unitLabel(unitInst, unitIdx)) or ""))
+    log(("%s roll started -> %s%s"):format(cat, tgt, unit and (" on " .. entryLabel(unit, unitIdx)) or ""))
 
     if Cfg.Protect then
         local n, r
-        if unitInst then n, r = readUnitData(cat, unitInst) end
+        if unit then n, r = readEntry(cat, unit) end
         if not n and label_ then n, r = readLabel(cat, label_) end
         if n and isHit(cat, n, r) then
             stopRoll("already " .. n .. " (protected)")
@@ -1526,7 +1611,17 @@ local function runSession(cat)
         if d:IsA("RemoteEvent") and #inConns < 400 then
             table.insert(inConns, d.OnClientEvent:Connect(function(...)
                 if Running ~= cat then return end
-                local n, r = singleName(table.pack(...), Data[cat])
+                local payload = table.pack(...)
+                local n, r
+                if unit and unit.id then
+                    -- the server's data update for exactly this unit
+                    local t = findInPayload(payload, unit.id)
+                    if t then
+                        n, r = readStrings(cat, entryStrings({ tbl = t }))
+                        if n and not unit.tbl then unit.tbl = t end
+                    end
+                end
+                if not n then n, r = singleName(payload, Data[cat]) end
                 if n then table.insert(inbox, { t = os.clock(), name = n, rank = r }) end
             end))
         end
@@ -1551,8 +1646,8 @@ local function runSession(cat)
 
         table.clear(inbox)
         local ctx = {
-            t0 = os.clock(), inbox = inbox, scope = panel, label = label_, unitInst = unitInst,
-            before = snapshot((not unitInst) and panel or nil, label_), unitBefore = unitInst and readUnitData(cat, unitInst) or nil,
+            t0 = os.clock(), inbox = inbox, scope = panel, label = label_, unit = unit,
+            before = snapshot((not unit) and panel or nil, label_), unitBefore = unit and readEntry(cat, unit) or nil,
         }
         if rec then
             local ok, ret = playRecipe(rec, unitValue)
@@ -1640,6 +1735,7 @@ autoLearn = function(remote, method, args)
         end
     end
     if not target then return end
+    if builtinRoll(target) then return end -- the game's own roll remote is used directly
     local existing = Recipes[target]
     if existing and not existing.auto then return end -- a manual recording wins
 
@@ -1656,7 +1752,7 @@ autoLearn = function(remote, method, args)
         for _, x in ipairs(Units) do
             if idOf(x, rec.unit.kind) == rec.unit.value then e = x break end
         end
-        if e then Cfg[target].UnitPath = instPath(e.inst) end
+        if e then Cfg[target].UnitId = entryKey(e) end
     end
     Cfg.Recipes[target] = recipeToCfg(rec)
     saveCfg()
@@ -1766,7 +1862,7 @@ do
     label(b, "Luck Boosts", 15, Theme.Accent, true)
     local boostInfo = label(b, "", 11, Theme.Sub)
     local function renderBoost()
-        boostInfo.Text = ("%d boost(s) recorded. Your luck from dice is set by the server; this uses the boosts/potions you own in one tap."):format(#BoostRecipes)
+        boostInfo.Text = ("%d boost(s) recorded. For permanently higher luck: Farm > Auto Buy Upgrades with filter Luck buys Luck, Trait Luck and Grade Luck upgrades."):format(#BoostRecipes)
     end
     renderBoost()
     local useAll = button(b, "USE ALL BOOSTS NOW", Theme.Accent, 36)
@@ -1803,14 +1899,14 @@ local function buildLuck(cat)
     UIRefs[cat].Unit = cycler(c, "Unit", function()
         if #Units == 0 then return "No units found yet - tap Units" end
         local e, idx = currentEntry(cat)
-        e.label = unitLabel(e.inst, idx)
+        e.label = entryLabel(e, idx)
         return ("%s   (%d of %d)"):format(e.label, idx, #Units)
     end, function(d)
         if #Units == 0 then refreshUnits() end
         if #Units == 0 then return end
         local _, idx = currentEntry(cat)
         idx = (((idx or 1) - 1 + d) % #Units) + 1
-        Cfg[cat].UnitPath = instPath(Units[idx].inst)
+        Cfg[cat].UnitId = entryKey(Units[idx])
         saveCfg()
     end)
 
@@ -1844,10 +1940,10 @@ local function buildLuck(cat)
     box.FocusLost:Connect(function() Cfg[cat].Custom = box.Text saveCfg() end)
 
     local r = hrow(c, 30)
-    smallBtn(r, "Re-learn Roll", 0.4, Theme.Rec).Activated:Connect(function()
+    smallBtn(r, "Record (backup)", 0.4, Theme.Rec).Activated:Connect(function()
         startLearn(cat .. " roll", "Open " .. cat .. "s, select your unit, tap Roll ONCE", LEARN_HINT[cat], true, function(rec)
             Recipes[cat] = rec
-            Cfg[cat].UnitPath = nil
+            Cfg[cat].UnitId = nil
             refreshUnits()
             Cfg.Recipes[cat] = recipeToCfg(rec)
             if not Cfg.Recipes[cat] then log(cat .. " recording works this session only (can't be saved)") end
@@ -1871,19 +1967,28 @@ end
 for _, cat in ipairs({ "Trait", "Grade", "Quirk" }) do buildLuck(cat) end
 
 -- FARM
+local function slotBuiltinLabel(slot)
+    if not slot.builtin then return nil end
+    local names = {}
+    for _, b in ipairs(slot.builtin) do
+        if netRemote(b[1], b[2], b[3]) then table.insert(names, b[1] .. "." .. b[3]) end
+    end
+    return #names > 0 and table.concat(names, ", ") or nil
+end
+
 local FarmRenders = {}
 genv.MaxHubFarmRenders = FarmRenders
 do
     local top = card(PFarm)
     label(top, "Farm & Auto", 15, Theme.Accent, true)
-    label(top, "Each macro: tap REC, do the action once in-game, tap the banner. Then switch it on.", 11, Theme.Sub)
+    label(top, "Slots marked Ready work right away. Others: tap REC, do the action once in-game, tap the banner, then switch on.", 11, Theme.Sub)
     toggle(top, "Pause farm while luck rolling", nil, function() return Cfg.PauseFarm end, function(v) Cfg.PauseFarm = v end)
 
     for _, slot in ipairs(FARM_SLOTS) do
         local c = card(PFarm)
         local s = Cfg.Farm[slot.key]
         local _, render = toggle(c, slot.name, "", function() return s.On end, function(v)
-            if v and not Recipes[slot.key] and not slot.fallback then
+            if v and not Recipes[slot.key] and not slot.fallback and not slotBuiltinLabel(slot) then
                 setStatus(slot.name .. ": tap REC first")
                 return
             end
@@ -1893,9 +1998,21 @@ do
         local info = label(c, "", 10, Theme.Sub)
         local function renderInfo()
             local rec = Recipes[slot.key]
-            info.Text = rec and ("Recorded: " .. rec.label) or (slot.fallback and ("Not recorded - presses the on-screen " .. slot.fallback .. " button") or ("Not recorded - " .. slot.hint))
+            local b = slotBuiltinLabel(slot)
+            info.Text = b and ("Ready - uses the game's " .. b)
+                or rec and ("Recorded: " .. rec.label)
+                or (slot.fallback and ("Not recorded - presses the on-screen " .. slot.fallback .. " button") or ("Not recorded - " .. slot.hint))
         end
         renderInfo()
+        if slot.key == "Upgrade" then
+            local fb = new("TextBox", {
+                Parent = c, Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = Theme.Item, Font = Enum.Font.Gotham, TextSize = 12,
+                TextColor3 = Theme.Text, PlaceholderText = "Only buy upgrades named: Luck, Roll Speed", PlaceholderColor3 = Theme.Sub,
+                Text = Cfg.UpgradeFilter, ClearTextOnFocus = false,
+            }, { corner(7), pad(6) })
+            fb.FocusLost:Connect(function() Cfg.UpgradeFilter = fb.Text saveCfg() end)
+            label(c, "Record buying ONE upgrade; the hub then buys every upgrade matching these words (Luck = Luck, Trait Luck, Grade Luck).", 10, Theme.Sub)
+        end
         stepper(c, "Every (sec)", function() return s.Interval end, function(v) s.Interval = v end, slot.interval < 1 and 0.1 or 1, 0.1, 600, "%.1f")
         local r = hrow(c, 28)
         smallBtn(r, "REC", 0.5, Theme.Rec).Activated:Connect(function()
@@ -1997,9 +2114,60 @@ end
 -- Farm scheduler
 ------------------------------------------------------------------------
 local nextRun, busy = {}, {}
+local function slotBuiltin(slot)
+    if not slot.builtin then return nil end
+    local calls = {}
+    for _, b in ipairs(slot.builtin) do
+        local r = netRemote(b[1], b[2], b[3])
+        if r then table.insert(calls, { remote = r, method = b[2] == "RF" and "InvokeServer" or "FireServer", args = { n = 0 } }) end
+    end
+    if #calls == 0 then return nil end
+    return { calls = calls, builtin = true }
+end
+
+-- Names of all upgrades on the UPGRADES screen ("2qi Luck XIII" -> "Luck XIII")
+local function upgradeNames()
+    local out = {}
+    for _, d in ipairs(PlayerGui:GetDescendants()) do
+        if d.Name == "Template" and d:IsA("GuiButton") and d:FindFirstAncestor("Upgrades") then
+            local name = clean(textOf(d)):match("^%S+%s+(.+)$")
+            if name then table.insert(out, name) end
+        end
+    end
+    return out
+end
+
+-- If the recorded upgrade was BuyUpgrade("<name>"), buy every upgrade that matches the filter
+local function smartUpgrade(rec)
+    local call = rec.calls[#rec.calls]
+    if not call or call.remote.Name ~= "BuyUpgrade" or call.args.n < 1 or type(call.args[1]) ~= "string" then return false end
+    local names = upgradeNames()
+    if not table.find(names, call.args[1]) then return false end
+    local words = splitTargets(Cfg.UpgradeFilter)
+    local bought = 0
+    for _, name in ipairs(names) do
+        local ok = #words == 0
+        for _, w in ipairs(words) do
+            if name:lower():find(w:lower(), 1, true) then ok = true break end
+        end
+        if ok then
+            local args = table.pack(table.unpack(call.args, 1, call.args.n))
+            args[1] = name
+            callRemote(call.remote, call.method, args)
+            bought += 1
+            task.wait(0.03)
+        end
+    end
+    return bought > 0
+end
+
 local function runSlot(slot)
     busy[slot.key] = true
-    local rec = Recipes[slot.key]
+    local rec = slotBuiltin(slot) or Recipes[slot.key]
+    if slot.key == "Upgrade" and rec and smartUpgrade(rec) then
+        busy[slot.key] = false
+        return
+    end
     if rec then
         local ok, err = playRecipe(rec)
         if not ok then
